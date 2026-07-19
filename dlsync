@@ -1,0 +1,148 @@
+#!/bin/bash
+
+set -euo pipefail
+
+playlist_ids=""
+queue_file=""
+status_file=""
+counter_file=""
+lock_file=""
+
+cleanup() {
+  rm -f "$playlist_ids" "$queue_file" "$status_file" "$counter_file" "$lock_file"
+}
+trap cleanup EXIT
+
+# ── Banner ──────────────────────────────────────────────────────────
+gum style \
+  --bold \
+  --border rounded \
+  --padding "1 2" \
+  --margin "1 0" \
+  "YouTube Music Download" \
+  "Download a playlist in parallel."
+
+# ── URL ─────────────────────────────────────────────────────────────
+if [ "${1:-}" != "" ]; then
+  url="$1"
+else
+  url=$(gum input \
+    --placeholder "https://music.youtube.com/playlist?list=..." \
+    --prompt "→ " \
+    --header "Playlist URL")
+fi
+
+if [ -z "$url" ]; then
+  echo "No URL provided"
+  exit 1
+fi
+
+# ── Target directory ────────────────────────────────────────────────
+default_dir="$HOME/Music/Youtube Music"
+target_dir=$(gum input \
+  --value "$default_dir" \
+  --prompt "→ " \
+  --header "Save to directory")
+
+if [ -z "$target_dir" ]; then
+  echo "No directory provided"
+  exit 1
+fi
+
+mkdir -p "$target_dir"
+
+# ── Confirm ─────────────────────────────────────────────────────────
+gum confirm "Download playlist to $target_dir?" || exit 0
+
+# ── Fetch playlist ──────────────────────────────────────────────────
+playlist_ids=$(mktemp)
+gum spin --spinner dot --title "Fetching playlist..." -- \
+  bash -c "yt-dlp --flat-playlist --print '%(id)s' '$url' > '$playlist_ids'"
+total=$(wc -l <"$playlist_ids")
+
+if [ "$total" -eq 0 ]; then
+  echo "No tracks found in playlist"
+  exit 1
+fi
+
+# ── Build queue ─────────────────────────────────────────────────────
+queue_file=$(mktemp)
+while IFS= read -r video_id; do
+  echo "https://music.youtube.com/watch?v=$video_id" >>"$queue_file"
+done <"$playlist_ids"
+
+# ── Parallel download ───────────────────────────────────────────────
+status_file=$(mktemp)
+counter_file=$(mktemp)
+echo 0 >"$counter_file"
+lock_file=$(mktemp)
+
+xargs -P 1 -I '{}' -a "$queue_file" \
+  env TARGET="$target_dir" STATUS="$status_file" \
+  COUNTER="$counter_file" LOCK="$lock_file" \
+  bash -c '
+        url="$1"
+        id="${url##*v=}"
+        id="${id%%&*}"
+        echo "↓  $id" >> "$STATUS"
+        yt-dlp --no-progress \
+            --sleep-interval 2 \
+            --max-sleep-interval 5 \
+            --extract-audio \
+            --audio-format best \
+            --embed-thumbnail \
+            --embed-metadata \
+            --output "$TARGET/%(artist)s - %(track,title)s.%(ext)s" \
+            "$url" 2>>"$STATUS"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            echo "✓  $id" >> "$STATUS"
+        else
+            echo "✗  $id" >> "$STATUS"
+        fi
+        (
+            flock -x 9
+            read -r c < "$COUNTER"
+            echo $((c + 1)) > "$COUNTER"
+        ) 9>"$LOCK"
+    ' _ '{}' &
+xargs_pid=$!
+
+spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+idx=0
+last_line=0
+
+while kill -0 "$xargs_pid" 2>/dev/null; do
+  current_lines=$(wc -l <"$status_file" 2>/dev/null || echo 0)
+  while [ "$current_lines" -gt "$last_line" ]; do
+    last_line=$((last_line + 1))
+    sed -n "${last_line}p" "$status_file"
+  done
+  read -r done_count <"$counter_file" 2>/dev/null || done_count=0
+  printf '\r\033[K%s  %d / %d' "${spinner_chars[$idx]}" "$done_count" "$total"
+  idx=$(((idx + 1) % ${#spinner_chars[@]}))
+  sleep 0.3
+done
+
+wait "$xargs_pid" || true
+
+current_lines=$(wc -l <"$status_file" 2>/dev/null || echo 0)
+while [ "$current_lines" -gt "$last_line" ]; do
+  last_line=$((last_line + 1))
+  sed -n "${last_line}p" "$status_file"
+done
+
+read -r done_count <"$counter_file" 2>/dev/null || done_count=0
+success_count=$(grep -c '^✓' "$status_file" 2>/dev/null || echo 0)
+fail_count=$((done_count - success_count))
+printf '\r\033[K✓  %d / %d downloaded (%d failed)\n\n' "$success_count" "$total" "$fail_count"
+
+# ── Summary ─────────────────────────────────────────────────────────
+gum style \
+  --border rounded \
+  --padding "1 2" \
+  "Download complete → $target_dir" \
+  "" \
+  "  ${total} tracks in playlist" \
+  "  ${success_count} downloaded" \
+  "  ${fail_count} failed"

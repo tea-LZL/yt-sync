@@ -1,0 +1,1 @@
+yt-dlp --extract-audio --audio-format best --embed-thumbnail --embed-metadata --sleep-interval 5 --max-sleep-interval 10 --output "$HOME/Music/Youtube Music/%(artist)s - %(track,title)s.%(ext)s" "https://music.youtube.com/playlist?list=YOUR_ID"
