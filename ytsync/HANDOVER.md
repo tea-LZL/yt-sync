@@ -32,6 +32,9 @@ theme = "textual-dark"
 
 Defaults for all keys live in `DEFAULTS` dict at top of file. Trash dir: `~/.local/share/yt-sync/trash/`.
 
+Downloads use yt-dlp to embed metadata and the thumbnail in the audio file.
+Output files follow `Artist - Song name.opus` (or the configured audio format).
+
 ## TUI keybindings
 
 | Key | Action |
@@ -67,6 +70,6 @@ Single file, no classes for data logic, just module-level functions + one Textua
 - **Visual theme switching**: config key `theme` exists but is a no-op. Textual is dark by default. Wire CSS variable overrides to it.
 - **Artist column in DataTable**: only Title column. Parse `Artist - Title` split in the table display if visual grouping matters.
 - **Multi-category selection**: selection clears on filter switch (1/2/3). Cross-category batch ops would need selection persistence.
-- **Download resume / skip-existing**: yt-dlp's `--no-overwrites` not passed. Re-downloads will overwrite.
+- **Download resume / skip-existing**: `--no-overwrites` is enabled, so existing output files are skipped.
 - **Progress bar widget**: replaced by RichLog line-by-line output. Add `ProgressBar` widget back if visual progress matters more than log history.
 - **Tests**: ponytail self-check only (`yt-sync --diff-only`). Add `test_yt_sync.py` if matching logic grows complex.

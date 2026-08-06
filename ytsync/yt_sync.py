@@ -81,8 +81,9 @@ def download_track(track: Track, music_dir: str, fmt: str) -> DownloadResult:
     proc = subprocess.run(
         [
             "yt-dlp", "-x", "--audio-format", fmt,
+            "--embed-metadata", "--embed-thumbnail",
             "--no-overwrites",
-            "-o", f"{music_dir}/%(title)s.%(ext)s",
+            "-o", f"{music_dir}/%(artist)s - %(track,title)s.%(ext)s",
             "--no-playlist", track.url,
         ],
         capture_output=True, text=True, timeout=600,

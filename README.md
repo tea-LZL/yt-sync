@@ -6,6 +6,7 @@ YouTube Music playlist ↔ local file sync tool. Fetches a playlist via yt-dlp, 
 
 ```bash
 pip install textual yt-dlp
+# Install ffmpeg with your system package manager as well.
 mkdir -p ~/.config/yt-sync
 ln -s "$PWD/ytsync/yt_sync.py" ~/.local/bin/yt-sync
 ```
@@ -22,6 +23,10 @@ audio_format = "opus"
 real_delete = false       # false = move orphans to trash dir
 theme = "textual-dark"
 ```
+
+Downloads are converted to the configured audio format with metadata and the
+thumbnail embedded. Files are named `Artist - Song name.opus` (or the
+configured audio extension).
 
 ## Usage
 
