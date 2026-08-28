@@ -591,7 +591,10 @@ class DirectoryPickerScreen(ModalScreen):
 class ConfigurationHomeScreen(ModalScreen):
     """Keyboard-first chooser for saved URL/directory configurations."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("e", "edit_selected", "Edit"),
+    ]
 
     DEFAULT_CSS = f"""
     ConfigurationHomeScreen {{
@@ -647,22 +650,48 @@ class ConfigurationHomeScreen(ModalScreen):
     ConfigurationHomeScreen #saved-config-list:focus > ListItem.-highlight {{
         background: {C_BLUE};
     }}
-    ConfigurationHomeScreen .saved-config-url {{
+    ConfigurationHomeScreen .saved-config-row {{
+        width: 100%;
+        height: 2;
+        layout: horizontal;
+    }}
+    ConfigurationHomeScreen .saved-config-title {{
+        width: auto;
+        max-width: 42;
+        min-width: 14;
+        height: 2;
         color: {C_FG};
         text-style: bold;
+        content-align: left middle;
         text-wrap: nowrap;
         text-overflow: ellipsis;
+        padding-right: 2;
     }}
-    ConfigurationHomeScreen .saved-config-dir {{
+    ConfigurationHomeScreen .saved-config-details {{
+        width: 1fr;
+        height: 2;
+        layout: vertical;
+    }}
+    ConfigurationHomeScreen .saved-config-url {{
+        width: 100%;
+        height: 1;
         color: {C_FG_DIM};
         text-wrap: nowrap;
         text-overflow: ellipsis;
     }}
+    ConfigurationHomeScreen .saved-config-dir {{
+        width: 100%;
+        height: 1;
+        color: {C_FG_DIM};
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }}
+    ConfigurationHomeScreen #saved-config-list:focus > ListItem.-highlight .saved-config-title,
     ConfigurationHomeScreen #saved-config-list:focus > ListItem.-highlight .saved-config-url,
     ConfigurationHomeScreen #saved-config-list:focus > ListItem.-highlight .saved-config-dir {{
         color: {C_BG};
     }}
-    ConfigurationHomeScreen .active-configuration .saved-config-url {{
+    ConfigurationHomeScreen .active-configuration .saved-config-title {{
         color: {C_CYAN};
     }}
     ConfigurationHomeScreen #saved-config-empty {{
@@ -731,6 +760,7 @@ class ConfigurationHomeScreen(ModalScreen):
             ),
             0,
         )
+        self._editing_index: int | None = None
 
     def compose(self) -> ComposeResult:
         cancel_label = "Quit" if self.initial else "Cancel"
@@ -745,13 +775,18 @@ class ConfigurationHomeScreen(ModalScreen):
                 items = []
                 for index, saved in enumerate(self._saved_configs):
                     active = index == self._active_index
-                    url_label = f"{saved['name']}  ·  {saved['playlist_url']}"
-                    if active:
-                        url_label = f"● Active  {url_label}"
+                    title_label = f"● {saved['name']}" if active else saved["name"]
                     items.append(
                         ListItem(
-                            Static(url_label, classes="saved-config-url", markup=False),
-                            Static(saved["music_dir"], classes="saved-config-dir", markup=False),
+                            Horizontal(
+                                Static(title_label, classes="saved-config-title", markup=False),
+                                Vertical(
+                                    Static(saved["playlist_url"], classes="saved-config-url", markup=False),
+                                    Static(saved["music_dir"], classes="saved-config-dir", markup=False),
+                                    classes="saved-config-details",
+                                ),
+                                classes="saved-config-row",
+                            ),
                             id=f"saved-config-{index}",
                             classes="active-configuration" if active else None,
                         )
@@ -773,6 +808,11 @@ class ConfigurationHomeScreen(ModalScreen):
                     id="create-configuration",
                     variant="primary",
                 )
+                yield Button(
+                    "Edit",
+                    id="edit-configuration",
+                    disabled=not bool(self._saved_configs),
+                )
                 yield Button(cancel_label, id="cancel-home")
 
     def on_mount(self) -> None:
@@ -780,6 +820,94 @@ class ConfigurationHomeScreen(ModalScreen):
             self.query_one("#saved-config-list", ListView).focus()
         else:
             self.query_one("#create-configuration", Button).focus()
+
+    def _selected_index(self) -> int | None:
+        if not self._saved_configs:
+            return None
+        try:
+            list_view = self.query_one("#saved-config-list", ListView)
+        except Exception:
+            return None
+        idx = list_view.index
+        if idx is None or idx < 0 or idx >= len(self._saved_configs):
+            return 0 if self._saved_configs else None
+        return idx
+
+    def _rebuild_saved_list(self) -> None:
+        try:
+            list_view = self.query_one("#saved-config-list", ListView)
+        except Exception:
+            return
+        # Preserve intended focus index
+        target_index = self._editing_index if self._editing_index is not None else self._active_index
+        if target_index is None or target_index >= len(self._saved_configs):
+            target_index = self._active_index
+        # Update existing items in place to avoid DuplicateIds on clear+recreate
+        # If the list length matches, update Statics; otherwise fall back to rebuild via remove
+        if len(list(list_view.query(ListItem))) == len(self._saved_configs):
+            for index, saved in enumerate(self._saved_configs):
+                try:
+                    item = list_view.query_one(f"#saved-config-{index}", ListItem)
+                    title_static = item.query_one(".saved-config-title", Static)
+                    url_static = item.query_one(".saved-config-url", Static)
+                    dir_static = item.query_one(".saved-config-dir", Static)
+                    title_label = f"● {saved['name']}" if index == self._active_index else saved["name"]
+                    if index == self._active_index:
+                        item.add_class("active-configuration")
+                    else:
+                        item.remove_class("active-configuration")
+                    title_static.update(title_label)
+                    url_static.update(saved["playlist_url"])
+                    dir_static.update(saved["music_dir"])
+                except Exception:
+                    # If any item missing, fall back to full rebuild
+                    pass
+            list_view.index = target_index if self._saved_configs else None
+            try:
+                list_view.focus()
+            except Exception:
+                pass
+            try:
+                self.query_one("#edit-configuration", Button).disabled = not bool(self._saved_configs)
+            except Exception:
+                pass
+            return
+        # Fallback: full rebuild (should be rare - only when lengths differ)
+        try:
+            list_view.remove()
+        except Exception:
+            pass
+        # Recreate items and mount new ListView
+        items = []
+        for index, saved in enumerate(self._saved_configs):
+            active = index == self._active_index
+            title_label = f"● {saved['name']}" if active else saved["name"]
+            items.append(
+                ListItem(
+                    Horizontal(
+                        Static(title_label, classes="saved-config-title", markup=False),
+                        Vertical(
+                            Static(saved["playlist_url"], classes="saved-config-url", markup=False),
+                            Static(saved["music_dir"], classes="saved-config-dir", markup=False),
+                            classes="saved-config-details",
+                        ),
+                        classes="saved-config-row",
+                    ),
+                    id=f"saved-config-{index}",
+                    classes="active-configuration" if active else None,
+                )
+            )
+        new_view = ListView(*items, initial_index=target_index if self._saved_configs else 0, id="saved-config-list")
+        # Mount where the old list was - inside config-home-card after saved-config-label
+        try:
+            self.query_one("#config-home-card").mount(new_view, before="#config-home-error")
+            new_view.focus()
+        except Exception:
+            pass
+        try:
+            self.query_one("#edit-configuration", Button).disabled = not bool(self._saved_configs)
+        except Exception:
+            pass
 
     @on(ListView.Selected)
     def on_saved_config_selected(self, event: ListView.Selected) -> None:
@@ -797,13 +925,125 @@ class ConfigurationHomeScreen(ModalScreen):
                 "playlist_url": "",
                 "music_dir": DEFAULTS["music_dir"],
             }
-            self.app.push_screen(HomeScreen(form_cfg), self._on_new_configuration)
+            self.app.push_screen(
+                HomeScreen(
+                    form_cfg,
+                    existing_configs=self._saved_configs,
+                    edit_index=None,
+                ),
+                self._on_new_configuration,
+            )
+        elif event.button.id == "edit-configuration":
+            self._start_edit()
         elif event.button.id == "cancel-home":
             self.dismiss(None)
+
+    def _start_edit(self) -> None:
+        idx = self._selected_index()
+        if idx is None:
+            self.query_one("#config-home-error", Label).update("No configuration selected to edit.")
+            return
+        self._editing_index = idx
+        self.query_one("#config-home-error", Label).update("")
+        saved = self._saved_configs[idx]
+        form_cfg = {
+            **self.cfg,
+            "name": saved["name"],
+            "playlist_url": saved["playlist_url"],
+            "music_dir": saved["music_dir"],
+        }
+        self.app.push_screen(
+            HomeScreen(
+                form_cfg,
+                is_edit=True,
+                existing_configs=self._saved_configs,
+                edit_index=idx,
+            ),
+            self._on_edit_configuration,
+        )
 
     def _on_new_configuration(self, values: SetupValues | None) -> None:
         if values is not None:
             self.dismiss(values)
+
+    def _on_edit_configuration(self, values: SetupValues | None) -> None:
+        if values is None:
+            self._editing_index = None
+            # Return focus to list
+            if self._saved_configs:
+                try:
+                    self.query_one("#saved-config-list", ListView).focus()
+                except Exception:
+                    pass
+            return
+        idx = self._editing_index
+        if idx is None or idx < 0 or idx >= len(self._saved_configs):
+            self._editing_index = None
+            return
+        old = self._saved_configs[idx]
+        is_active = (
+            old["playlist_url"] == self.cfg.get("playlist_url", "")
+            and old["music_dir"] == self.cfg.get("music_dir", DEFAULTS["music_dir"])
+        )
+        # Update the entry
+        self._saved_configs[idx] = {
+            "name": values.name,
+            "playlist_url": values.playlist_url,
+            "music_dir": values.music_dir,
+        }
+        # Keep cfg in sync for persistence
+        self.cfg["saved_configs"] = list(self._saved_configs)
+        if is_active:
+            self.cfg["playlist_url"] = values.playlist_url
+            self.cfg["music_dir"] = values.music_dir
+            self._active_index = idx
+        else:
+            # Recompute active index if URL/dir changed elsewhere
+            active_url = self.cfg.get("playlist_url", "")
+            active_dir = self.cfg.get("music_dir", DEFAULTS["music_dir"])
+            self._active_index = next(
+                (
+                    i
+                    for i, s in enumerate(self._saved_configs)
+                    if s["playlist_url"] == active_url and s["music_dir"] == active_dir
+                ),
+                self._active_index,
+            )
+        # Ensure destination exists
+        try:
+            Path(values.music_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.query_one("#config-home-error", Label).update(f"Cannot create destination folder: {exc}")
+            # Revert in-memory change
+            self._saved_configs[idx] = old
+            self.cfg["saved_configs"] = list(self._saved_configs)
+            if is_active:
+                self.cfg["playlist_url"] = old["playlist_url"]
+                self.cfg["music_dir"] = old["music_dir"]
+            self._editing_index = None
+            return
+        try:
+            save_config(self.cfg)
+        except OSError as exc:
+            self.query_one("#config-home-error", Label).update(f"Could not save config: {exc}")
+            self._saved_configs[idx] = old
+            self.cfg["saved_configs"] = list(self._saved_configs)
+            if is_active:
+                self.cfg["playlist_url"] = old["playlist_url"]
+                self.cfg["music_dir"] = old["music_dir"]
+            self._editing_index = None
+            return
+        self.query_one("#config-home-error", Label).update("")
+        self._rebuild_saved_list()
+        # Notify via app if possible
+        try:
+            self.app.notify(f"Updated {values.name}", severity="information", timeout=2)
+        except Exception:
+            pass
+        self._editing_index = None
+
+    def action_edit_selected(self) -> None:
+        self._start_edit()
 
     def action_cancel(self) -> None:
         if self.initial:
@@ -927,17 +1167,33 @@ class HomeScreen(ModalScreen):
     }}
     """
 
-    def __init__(self, cfg: dict, initial: bool = False):
+    def __init__(
+        self,
+        cfg: dict,
+        initial: bool = False,
+        is_edit: bool = False,
+        existing_configs: list[dict[str, str]] | None = None,
+        edit_index: int | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
         self.initial = initial
+        self.is_edit = is_edit
+        self.existing_configs = existing_configs or []
+        self.edit_index = edit_index
 
     def compose(self) -> ComposeResult:
         cancel_label = "Quit" if self.initial else "Cancel"
+        subtitle = (
+            "Edit the selected configuration."
+            if self.is_edit
+            else "Create a configuration with one playlist URL and one download folder."
+        )
+        action_label = "Save changes" if self.is_edit else "Start sync"
         with Vertical(id="home-card"):
             yield Static("♫  yt-sync", id="home-title")
             yield Static(
-                "Create a configuration with one playlist URL and one download folder.",
+                subtitle,
                 id="home-subtitle",
             )
             yield Label("Configuration name", classes="home-label")
@@ -962,7 +1218,7 @@ class HomeScreen(ModalScreen):
                 yield Button("Browse…", id="browse-folder")
             yield Label("", id="home-error")
             with Horizontal(id="home-actions"):
-                yield Button("Start sync", id="start-sync", variant="primary")
+                yield Button(action_label, id="start-sync", variant="primary")
                 yield Button(cancel_label, id="cancel-home")
 
     def on_mount(self) -> None:
@@ -1005,6 +1261,17 @@ class HomeScreen(ModalScreen):
         if values is None:
             self.query_one("#home-error", Label).update(error)
             return
+        # Prevent duplicate URL/directory pairs (skip self when editing).
+        for idx, existing in enumerate(self.existing_configs):
+            if self.edit_index is not None and idx == self.edit_index:
+                continue
+            existing_url = str(existing.get("playlist_url", "")).strip()
+            existing_dir = str(Path(str(existing.get("music_dir", ""))).expanduser())
+            if existing_url == values.playlist_url and existing_dir == values.music_dir:
+                self.query_one("#home-error", Label).update(
+                    "A configuration with this URL and directory already exists."
+                )
+                return
         try:
             Path(values.music_dir).mkdir(parents=True, exist_ok=True)
         except OSError as exc:

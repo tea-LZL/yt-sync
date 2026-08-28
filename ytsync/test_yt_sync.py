@@ -382,9 +382,15 @@ class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
         app._do_refresh = lambda: None
 
         async with app.run_test(size=(100, 40)):
-            identity = app.screen.query_one("#saved-config-0 .saved-config-url", Static)
-            self.assertTrue(str(identity.render()).startswith("● Active  Gym mix  ·  "))
-            self.assertIn(saved["playlist_url"], str(identity.render()))
+            title = app.screen.query_one("#saved-config-0 .saved-config-title", Static)
+            url = app.screen.query_one("#saved-config-0 .saved-config-url", Static)
+            directory = app.screen.query_one("#saved-config-0 .saved-config-dir", Static)
+            self.assertIn("Gym mix", str(title.render()))
+            self.assertTrue(str(title.render()).startswith("●"))
+            self.assertIn(saved["playlist_url"], str(url.render()))
+            self.assertEqual(str(directory.render()), saved["music_dir"])
+            # Title is big header: bold and takes vertical space (height 2) while url/dir are 1 each
+            self.assertEqual(title.content_region.height, 2)
 
     async def test_active_marker_matches_the_active_url_and_directory(self):
         first = {
@@ -408,10 +414,11 @@ class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
         app._do_refresh = lambda: None
 
         async with app.run_test(size=(100, 40)):
-            first_identity = app.screen.query_one("#saved-config-0 .saved-config-url", Static)
-            second_identity = app.screen.query_one("#saved-config-1 .saved-config-url", Static)
-            self.assertFalse(str(first_identity.render()).startswith("● Active"))
-            self.assertTrue(str(second_identity.render()).startswith("● Active  Second collection"))
+            first_title = app.screen.query_one("#saved-config-0 .saved-config-title", Static)
+            second_title = app.screen.query_one("#saved-config-1 .saved-config-title", Static)
+            self.assertFalse(str(first_title.render()).startswith("●"))
+            self.assertTrue(str(second_title.render()).startswith("●"))
+            self.assertIn("Second collection", str(second_title.render()))
 
     async def test_keyboard_selection_activates_a_saved_configuration(self):
         first = {
@@ -451,6 +458,7 @@ class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_saved_config_row_keeps_url_and_directory_on_two_lines(self):
         active = {
+            "name": "My collection",
             "playlist_url": "https://music.youtube.com/playlist?list=PLIIlrAvOGW9yv-Y8jI5tHOSMaywVTuRGA",
             "music_dir": "/home/tea/Music/Youtube Music",
         }
@@ -458,11 +466,16 @@ class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
         app._do_refresh = lambda: None
 
         async with app.run_test(size=(80, 24)):
+            title = app.screen.query_one("#saved-config-0 .saved-config-title", Static)
             url = app.screen.query_one("#saved-config-0 .saved-config-url", Static)
             directory = app.screen.query_one("#saved-config-0 .saved-config-dir", Static)
+            self.assertEqual(title.content_region.height, 2)
             self.assertEqual(url.content_region.height, 1)
             self.assertEqual(directory.content_region.height, 1)
             self.assertEqual(directory.region.y, url.region.y + 1)
+            # Title is big header on left, url/dir stacked on right
+            self.assertLess(title.region.x, url.region.x)
+            self.assertEqual(url.region.x, directory.region.x)
 
     async def test_create_new_configuration_saves_and_activates_the_new_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -495,6 +508,127 @@ class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.cfg["saved_configs"], [created])
         save.assert_called_once_with(app.cfg)
         self.assertEqual(refresh_calls, [True])
+
+    async def test_edit_configuration_is_keyboard_reachable_and_prefills_form(self):
+        saved = {
+            "name": "Gym mix",
+            "playlist_url": "https://music.youtube.com/playlist?list=gym",
+            "music_dir": "/tmp/gym",
+        }
+        app = YTSyncApp({**DEFAULTS, **saved, "saved_configs": [saved]})
+        app._do_refresh = lambda: None
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            self.assertIsInstance(app.screen, yt_sync.ConfigurationHomeScreen)
+            # Edit button exists and is not disabled when a config is present
+            edit = app.screen.query_one("#edit-configuration", Button)
+            self.assertFalse(edit.disabled)
+            # Focus list, press 'e' to edit
+            app.screen.query_one("#saved-config-list", ListView).focus()
+            await pilot.press("e")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, yt_sync.HomeScreen)
+            self.assertEqual(app.screen.query_one("#configuration-name", Input).value, saved["name"])
+            self.assertEqual(app.screen.query_one("#playlist-url", Input).value, saved["playlist_url"])
+            self.assertEqual(app.screen.query_one("#music-dir", Input).value, saved["music_dir"])
+            # Edit form shows Save action, not Create semantics
+            self.assertIn("Save", str(app.screen.query_one("#start-sync", Button).label))
+
+    async def test_edit_configuration_updates_saved_entry_and_persists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original = {
+                "name": "Gym mix",
+                "playlist_url": "https://music.youtube.com/playlist?list=gym",
+                "music_dir": str(Path(tmp) / "gym"),
+            }
+            cfg = {**DEFAULTS, **original, "saved_configs": [original]}
+            app = YTSyncApp(cfg)
+            app._do_refresh = lambda: None
+
+            updated_dir = str(Path(tmp) / "gym-edited")
+            with patch("yt_sync.save_config") as save:
+                async with app.run_test(size=(100, 40)) as pilot:
+                    app.screen.query_one("#edit-configuration", Button).press()
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, yt_sync.HomeScreen)
+                    app.screen.query_one("#configuration-name", Input).value = "Gym edited"
+                    app.screen.query_one("#music-dir", Input).value = updated_dir
+                    app.screen.query_one("#start-sync", Button).press()
+                    await pilot.pause()
+                    await pilot.pause()
+                    # Still on configuration home after save (edit stays in chooser)
+                    self.assertIsInstance(app.screen, yt_sync.ConfigurationHomeScreen)
+                    title = app.screen.query_one("#saved-config-0 .saved-config-title", Static)
+                    self.assertIn("Gym edited", str(title.render()))
+                    directory = app.screen.query_one("#saved-config-0 .saved-config-dir", Static)
+                    self.assertEqual(str(directory.render()), updated_dir)
+
+            self.assertEqual(app.cfg["saved_configs"][0]["name"], "Gym edited")
+            self.assertEqual(app.cfg["saved_configs"][0]["music_dir"], updated_dir)
+            # Active config was edited, so active follows
+            self.assertEqual(app.cfg["playlist_url"], original["playlist_url"])
+            self.assertEqual(app.cfg["music_dir"], updated_dir)
+            save.assert_called_once()
+            self.assertTrue(Path(updated_dir).is_dir())
+
+    async def test_edit_duplicate_url_and_directory_is_rejected(self):
+        first = {
+            "name": "First",
+            "playlist_url": "https://music.youtube.com/playlist?list=first",
+            "music_dir": "/tmp/first",
+        }
+        second = {
+            "name": "Second",
+            "playlist_url": "https://music.youtube.com/playlist?list=second",
+            "music_dir": "/tmp/second",
+        }
+        cfg = {**DEFAULTS, **first, "saved_configs": [first, second]}
+        app = YTSyncApp(cfg)
+        app._do_refresh = lambda: None
+
+        with patch("yt_sync.save_config") as save:
+            async with app.run_test(size=(100, 40)) as pilot:
+                # Highlight second item
+                await pilot.press("down")
+                await pilot.pause()
+                app.screen.query_one("#edit-configuration", Button).press()
+                await pilot.pause()
+                self.assertIsInstance(app.screen, yt_sync.HomeScreen)
+                # Try to make second collide with first
+                app.screen.query_one("#playlist-url", Input).value = first["playlist_url"]
+                app.screen.query_one("#music-dir", Input).value = first["music_dir"]
+                app.screen.query_one("#start-sync", Button).press()
+                await pilot.pause()
+                # Should stay on edit form with validation error
+                self.assertIsInstance(app.screen, yt_sync.HomeScreen)
+                self.assertIn("already exists", str(app.screen.query_one("#home-error", Static).render()).lower())
+                save.assert_not_called()
+
+    async def test_edit_cancel_keeps_original_configuration(self):
+        saved = {
+            "name": "Gym mix",
+            "playlist_url": "https://music.youtube.com/playlist?list=gym",
+            "music_dir": "/tmp/gym",
+        }
+        cfg = {**DEFAULTS, **saved, "saved_configs": [saved]}
+        app = YTSyncApp(cfg)
+        app._do_refresh = lambda: None
+
+        with patch("yt_sync.save_config") as save:
+            async with app.run_test(size=(100, 40)) as pilot:
+                app.screen.query_one("#edit-configuration", Button).press()
+                await pilot.pause()
+                self.assertIsInstance(app.screen, yt_sync.HomeScreen)
+                app.screen.query_one("#configuration-name", Input).value = "Changed"
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, yt_sync.ConfigurationHomeScreen)
+                title = app.screen.query_one("#saved-config-0 .saved-config-title", Static)
+                self.assertIn("Gym mix", str(title.render()))
+                self.assertNotIn("Changed", str(title.render()))
+
+        save.assert_not_called()
+        self.assertEqual(app.cfg["saved_configs"][0]["name"], "Gym mix")
 
 
 class StartupFlowTests(unittest.IsolatedAsyncioTestCase):
