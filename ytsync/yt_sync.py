@@ -11,7 +11,9 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from difflib import SequenceMatcher
 
@@ -24,14 +26,126 @@ DEFAULTS = {
     "trash_dir": str(Path.home() / ".local" / "share" / "yt-sync" / "trash"),
     "real_delete": False,
     "theme": "textual-dark",
+    "saved_configs": [],
 }
+
+AUDIO_EXTS = {".opus", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".wav", ".webm"}
+STATE_DIR = Path.home() / ".local" / "share" / "yt-sync"
+FAILED_PATH = STATE_DIR / "failed.json"
+
+
+def _saved_config_entry(value: object) -> dict[str, str] | None:
+    """Return a persisted named configuration, ignoring malformed entries."""
+    if not isinstance(value, dict):
+        return None
+    playlist_url = value.get("playlist_url")
+    music_dir = value.get("music_dir")
+    if not isinstance(playlist_url, str) or not playlist_url.strip():
+        return None
+    if not isinstance(music_dir, str) or not music_dir.strip():
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or not name.strip():
+        name = Path(music_dir).expanduser().name or "Saved configuration"
+    return {"name": name.strip(), "playlist_url": playlist_url, "music_dir": music_dir}
+
+
+def saved_configurations(cfg: dict) -> list[dict[str, str]]:
+    """Normalize saved configurations and retain the active legacy pair."""
+    normalized: list[dict[str, str]] = []
+    raw_configs = cfg.get("saved_configs", [])
+    if isinstance(raw_configs, list):
+        for raw_config in raw_configs:
+            saved = _saved_config_entry(raw_config)
+            if saved is not None and not any(
+                saved["playlist_url"] == existing["playlist_url"]
+                and saved["music_dir"] == existing["music_dir"]
+                for existing in normalized
+            ):
+                normalized.append(saved)
+
+    active = _saved_config_entry(
+        {
+            "playlist_url": cfg.get("playlist_url", ""),
+            "music_dir": cfg.get("music_dir", DEFAULTS["music_dir"]),
+        }
+    )
+    if active is not None and not any(
+        active["playlist_url"] == existing["playlist_url"]
+        and active["music_dir"] == existing["music_dir"]
+        for existing in normalized
+    ):
+        normalized.append(active)
+    return normalized
+
+
+# ── failed-track state ─────────────────────────────────────────────
+def load_failed() -> dict[str, dict]:
+    """Previously-failed downloads, keyed by track id."""
+    if FAILED_PATH.exists():
+        try:
+            return json.loads(FAILED_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_failed(failed: dict[str, dict]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    FAILED_PATH.write_text(json.dumps(failed, indent=2, ensure_ascii=False))
+
+
+def prune_failed(failed: dict[str, dict], valid_ids: set[str]) -> int:
+    """Drop entries for tracks no longer in the playlist; return count removed."""
+    stale = [tid for tid in failed if tid not in valid_ids]
+    for tid in stale:
+        del failed[tid]
+    return len(stale)
 
 
 def load_config() -> dict:
+    cfg = {**DEFAULTS, "saved_configs": []}
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, "rb") as f:
-            return {**DEFAULTS, **tomllib.load(f).get("yt-sync", {})}
-    return dict(DEFAULTS)
+            section = tomllib.load(f).get("yt-sync", {})
+        if isinstance(section, dict):
+            cfg.update({key: value for key, value in section.items() if key != "saved_configs"})
+            cfg["saved_configs"] = section.get("saved_configs", [])
+    cfg["saved_configs"] = saved_configurations(cfg)
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    """Persist settings plus named saved configurations atomically."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    cfg["saved_configs"] = saved_configurations(cfg)
+
+    def quote(value: object) -> str:
+        return json.dumps(str(value), ensure_ascii=False)
+
+    lines = [
+        "[yt-sync]",
+        f"playlist_url = {quote(cfg.get('playlist_url', ''))}",
+        f"music_dir = {quote(cfg.get('music_dir', DEFAULTS['music_dir']))}",
+        f"audio_format = {quote(cfg.get('audio_format', DEFAULTS['audio_format']))}",
+        f"trash_dir = {quote(cfg.get('trash_dir', DEFAULTS['trash_dir']))}",
+        f"real_delete = {'true' if cfg.get('real_delete', False) else 'false'}",
+        f"theme = {quote(cfg.get('theme', DEFAULTS['theme']))}",
+    ]
+    for saved in cfg["saved_configs"]:
+        lines.extend(
+            [
+                "",
+                "[[yt-sync.saved_configs]]",
+                f"name = {quote(saved['name'])}",
+                f"playlist_url = {quote(saved['playlist_url'])}",
+                f"music_dir = {quote(saved['music_dir'])}",
+            ]
+        )
+    content = "\n".join(lines) + "\n"
+    temporary_path = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.tmp")
+    temporary_path.write_text(content, encoding="utf-8")
+    temporary_path.replace(CONFIG_PATH)
 
 
 # ── data ────────────────────────────────────────────────────────────
@@ -46,6 +160,42 @@ class Track:
 class LocalFile:
     path: Path
     stem: str
+
+
+@dataclass
+class RowEntry:
+    """One displayed table row: identity lives here, not in reconstructed indexes."""
+    title: str
+    status: str
+    row_type: str  # matched | missing | failed | orphan
+    track: Track | None = None
+    local: LocalFile | None = None
+
+
+@dataclass(frozen=True)
+class SetupValues:
+    name: str
+    playlist_url: str
+    music_dir: str
+
+
+def validate_setup_values(
+    name: str, url: str, music_dir: str
+) -> tuple[SetupValues | None, str]:
+    """Validate and normalize values submitted by the setup screen."""
+    name = name.strip()
+    url = url.strip()
+    music_dir = music_dir.strip()
+    if not name:
+        return None, "Enter a configuration name."
+    if not url:
+        return None, "Enter a playlist URL."
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None, "Enter a valid HTTP(S) playlist URL."
+    if not music_dir:
+        return None, "Enter a destination folder."
+    return SetupValues(name, url, str(Path(music_dir).expanduser())), ""
 
 
 # ── normalize ───────────────────────────────────────────────────────
@@ -78,9 +228,13 @@ class DownloadResult:
 
 
 def download_track(track: Track, music_dir: str, fmt: str) -> DownloadResult:
+    try:
+        Path(music_dir).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return DownloadResult(success=False, error=f"Cannot create music directory: {exc}")
     proc = subprocess.run(
         [
-            "yt-dlp", "-x", "--audio-format", fmt,
+            "yt-dlp", "-x", "-f", "bestaudio/best", "--audio-format", fmt,
             "--embed-metadata", "--embed-thumbnail",
             "--no-overwrites",
             "-o", f"{music_dir}/%(artist)s - %(track,title)s.%(ext)s",
@@ -88,7 +242,12 @@ def download_track(track: Track, music_dir: str, fmt: str) -> DownloadResult:
         ],
         capture_output=True, text=True, timeout=600,
     )
+    failed = load_failed()
     if proc.returncode == 0:
+        # Clear any previous failure; the track is on disk (or already was).
+        if track.id in failed:
+            del failed[track.id]
+            save_failed(failed)
         return DownloadResult(success=True)
     # Extract meaningful error from stderr
     err = ""
@@ -98,20 +257,76 @@ def download_track(track: Track, music_dir: str, fmt: str) -> DownloadResult:
             break
     if not err:
         err = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "Unknown error"
+    # Record the failure so the track stops being re-attempted as "missing",
+    # and clean up yt-dlp leftovers (.temp.* files, stray thumbnails).
+    failed[track.id] = {
+        "title": track.title,
+        "url": track.url,
+        "error": err,
+        "failed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_failed(failed)
+    cleanup_track_artifacts(track, music_dir)
     return DownloadResult(success=False, error=err)
+
+
+def cleanup_track_artifacts(track: Track, music_dir: str) -> None:
+    """Remove yt-dlp garbage left by a failed download for this track."""
+    nt = normalize(track.title)
+    if not nt:
+        return
+    p = Path(music_dir)
+    for f in p.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name
+        if ".temp." in name and nt in normalize(name):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        elif f.suffix.lower() in {".webp", ".png", ".jpg", ".jpeg"} and nt in normalize(name):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 # ── scan ────────────────────────────────────────────────────────────
 def scan_local(music_dir: str) -> list[LocalFile]:
-    exts = {".opus", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".wav", ".webm"}
     p = Path(music_dir)
     if not p.exists():
         return []
     return [
         LocalFile(path=f, stem=f.stem)
         for f in p.iterdir()
-        if f.is_file() and f.suffix.lower() in exts
+        if f.is_file()
+        and f.suffix.lower() in AUDIO_EXTS
+        and ".temp." not in f.name  # yt-dlp conversion leftovers
     ]
+
+
+def cleanup_stale_artifacts(music_dir: str) -> int:
+    """Remove old yt-dlp leftovers: any *.temp.* file and stray thumbnail
+    images standing next to a matching audio file. Returns count removed."""
+    p = Path(music_dir)
+    if not p.exists():
+        return 0
+    removed = 0
+    stems = {f.stem for f in p.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS}
+    for f in p.iterdir():
+        if not f.is_file():
+            continue
+        try:
+            if ".temp." in f.name:
+                f.unlink()
+                removed += 1
+            elif f.suffix.lower() in {".webp", ".png", ".jpg", ".jpeg"} and f.stem in stems:
+                f.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 # ── match ───────────────────────────────────────────────────────────
@@ -120,9 +335,20 @@ class DiffResult:
     matched: list[tuple[Track, LocalFile]]
     missing: list[Track]
     orphans: list[LocalFile]
+    failed: list[tuple[Track, str]] = field(default_factory=list)
 
 
-def diff(playlist: list[Track], local: list[LocalFile]) -> DiffResult:
+def build_diff(playlist: list[Track], local: list[LocalFile]) -> DiffResult:
+    """Load failed-track state, prune it to the playlist, then diff."""
+    failed = load_failed()
+    if prune_failed(failed, {t.id for t in playlist}):
+        save_failed(failed)
+    return diff(playlist, local, failed)
+
+
+def diff(playlist: list[Track], local: list[LocalFile],
+         failed_map: dict[str, dict] | None = None) -> DiffResult:
+    failed_map = failed_map or {}
     norm_local = {normalize(f.stem): f for f in local}
     title_index: dict[str, LocalFile] = {}
     for f in local:
@@ -132,6 +358,7 @@ def diff(playlist: list[Track], local: list[LocalFile]) -> DiffResult:
 
     matched: list[tuple[Track, LocalFile]] = []
     missing: list[Track] = []
+    failed: list[tuple[Track, str]] = []
     used = set()
 
     for t in playlist:
@@ -139,7 +366,8 @@ def diff(playlist: list[Track], local: list[LocalFile]) -> DiffResult:
         if nt in norm_local:
             matched.append((t, norm_local[nt]))
             used.add(norm_local[nt].path)
-        elif nt in title_index and title_index[nt].path not in used:
+        elif nt in title_index:
+            # A file may satisfy multiple playlist entries (duplicate songs).
             matched.append((t, title_index[nt]))
             used.add(title_index[nt].path)
         else:
@@ -155,11 +383,13 @@ def diff(playlist: list[Track], local: list[LocalFile]) -> DiffResult:
             if best and best_ratio > 0.85:
                 matched.append((t, best))
                 used.add(best.path)
+            elif t.id in failed_map:
+                failed.append((t, failed_map[t.id]["error"]))
             else:
                 missing.append(t)
 
     orphans = [f for f in local if f.path not in used]
-    return DiffResult(matched=matched, missing=missing, orphans=orphans)
+    return DiffResult(matched=matched, missing=missing, orphans=orphans, failed=failed)
 
 
 # ── actions ─────────────────────────────────────────────────────────
@@ -173,31 +403,625 @@ def delete_file(local: LocalFile) -> None:
     local.path.unlink()
 
 
+def resolve_download_targets(
+    selected: set[str],
+    row_map: dict[str, RowEntry],
+    missing: list[Track],
+    failed: list[tuple[Track, str]],
+    mode: str,
+) -> list[Track]:
+    """Tracks `d` should download.
+
+    Empty selection: all missing, or all failed when the Failed filter is on.
+    Non-empty selection: only selected missing/failed rows — never fall back
+    to the full list.
+    """
+    if selected:
+        return [
+            e.track
+            for k, e in row_map.items()
+            if k in selected and e.row_type in ("missing", "failed") and e.track is not None
+        ]
+    if mode == "failed":
+        return [t for t, _err in failed]
+    return list(missing)
+
+
+def resolve_trash_targets(
+    selected: set[str],
+    row_map: dict[str, RowEntry],
+    orphans: list[LocalFile],
+) -> list[LocalFile]:
+    """Orphans `t` should trash/delete. Same empty vs selected rules as download."""
+    if selected:
+        return [
+            e.local
+            for k, e in row_map.items()
+            if k in selected and e.row_type == "orphan" and e.local is not None
+        ]
+    return list(orphans)
+
+
+def nearest_existing_directory(path: str | Path) -> Path:
+    """Find a usable tree root for an existing or future directory path."""
+    candidate = Path(path).expanduser()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate if candidate.is_dir() else Path.home()
+
+
 # ── TUI ─────────────────────────────────────────────────────────────
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.widgets import (  # noqa: E402
-    DataTable, Footer, Header, Label, LoadingIndicator, RichLog, Static,
+    Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView,
+    LoadingIndicator, RichLog, Static,
 )
 from textual.containers import Horizontal, Vertical  # noqa: E402
 from textual.binding import Binding  # noqa: E402
+from textual.coordinate import Coordinate  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
 from textual import events, on  # noqa: E402
 
 # ── Colors ──────────────────────────────────────────────────────────
-# Tokyo Night inspired palette
-C_BG         = "#1a1b26"
-C_BG_DARK    = "#16161e"
-C_BG_HL      = "#292e42"
-C_FG         = "#c0caf5"
-C_FG_DIM     = "#565f89"
-C_BLUE       = "#7aa2f7"
-C_CYAN       = "#7dcfff"
-C_GREEN      = "#9ece6a"
-C_YELLOW     = "#e0af68"
-C_RED        = "#f7768e"
-C_MAGENTA    = "#bb9af7"
-C_ORANGE     = "#ff9e64"
-C_TEAL       = "#73daca"
+# Semantic slate palette: surfaces stay quiet; status colors carry meaning.
+C_BG         = "#0f1117"
+C_BG_DARK    = "#171a23"
+C_BG_HL      = "#252b3a"
+C_FG         = "#e6eaf2"
+C_FG_DIM     = "#9aa4b2"
+C_BLUE       = "#79a8ff"
+C_CYAN       = "#8bd5ff"
+C_GREEN      = "#8fd694"
+C_YELLOW     = "#f2c777"
+C_RED        = "#ff7a90"
+C_MAGENTA    = "#c7a4ff"
+C_ORANGE     = "#ffae78"
+C_TEAL       = "#72dbc4"
+
+
+class DirectoryPickerScreen(ModalScreen):
+    """Modal directory browser used by the setup screen."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = f"""
+    DirectoryPickerScreen {{
+        align: center middle;
+        background: {C_BG} 92%;
+    }}
+    DirectoryPickerScreen #picker-card {{
+        width: 82;
+        max-width: 94%;
+        height: 80%;
+        max-height: 30;
+        min-height: 12;
+        background: {C_BG_DARK};
+        border: round {C_BG_HL};
+        padding: 1 2;
+    }}
+    DirectoryPickerScreen #picker-title {{
+        color: {C_BLUE};
+        text-style: bold;
+        padding-bottom: 1;
+    }}
+    DirectoryPickerScreen #picker-selection {{
+        color: {C_FG_DIM};
+        height: 2;
+        padding-bottom: 1;
+    }}
+    DirectoryPickerScreen #directory-tree {{
+        height: 1fr;
+        background: {C_BG};
+        border: round {C_BG_HL};
+        color: {C_FG};
+        scrollbar-color: {C_FG_DIM};
+        scrollbar-color-hover: {C_BLUE};
+    }}
+    DirectoryPickerScreen #picker-actions {{
+        height: auto;
+        align-horizontal: right;
+        padding-top: 1;
+    }}
+    DirectoryPickerScreen Button {{
+        min-width: 14;
+        height: 3;
+        margin-left: 1;
+    }}
+    DirectoryPickerScreen Button.-style-default {{
+        background: {C_BG_HL};
+        color: {C_FG};
+        border: none !important;
+    }}
+    DirectoryPickerScreen Button.-style-default.-primary {{
+        background: {C_BLUE} !important;
+        color: {C_BG} !important;
+    }}
+    DirectoryPickerScreen Button.-style-default:hover {{
+        background: {C_BLUE} !important;
+        color: {C_BG} !important;
+        border: none !important;
+    }}
+    DirectoryPickerScreen Button.-style-default.-primary:hover {{
+        background: {C_CYAN} !important;
+        border: none !important;
+    }}
+    DirectoryPickerScreen Button.-style-default:focus {{
+        border: round {C_CYAN} !important;
+        text-style: bold;
+    }}
+    DirectoryPickerScreen Button.-style-default:disabled {{
+        color: {C_FG_DIM} !important;
+        background: {C_BG} !important;
+        border: none !important;
+    }}
+    """
+
+    def __init__(self, initial_path: str | Path):
+        super().__init__()
+        self._selected_path = nearest_existing_directory(initial_path)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker-card"):
+            yield Static("Choose download folder", id="picker-title")
+            yield Label(str(self._selected_path), id="picker-selection")
+            yield DirectoryTree(self._selected_path, id="directory-tree")
+            with Horizontal(id="picker-actions"):
+                yield Button("Choose", id="picker-choose", variant="primary")
+                yield Button("Cancel", id="picker-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#directory-tree", DirectoryTree).focus()
+
+    @on(DirectoryTree.DirectorySelected)
+    def on_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
+        self._selected_path = event.path
+        self.query_one("#picker-selection", Label).update(str(event.path))
+
+    @on(Button.Pressed)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "picker-choose":
+            self.dismiss(self._selected_path)
+        elif event.button.id == "picker-cancel":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfigurationHomeScreen(ModalScreen):
+    """Keyboard-first chooser for saved URL/directory configurations."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = f"""
+    ConfigurationHomeScreen {{
+        align: center middle;
+        background: {C_BG} 92%;
+    }}
+    ConfigurationHomeScreen #config-home-card {{
+        width: 88;
+        max-width: 94%;
+        height: auto;
+        max-height: 90%;
+        background: {C_BG_DARK};
+        border: round {C_BG_HL};
+        padding: 1 2;
+    }}
+    ConfigurationHomeScreen #config-home-title {{
+        color: {C_BLUE};
+        text-style: bold;
+        padding-bottom: 0;
+    }}
+    ConfigurationHomeScreen #config-home-subtitle {{
+        color: {C_FG_DIM};
+        padding-bottom: 0;
+    }}
+    ConfigurationHomeScreen #saved-config-label {{
+        color: {C_FG};
+        text-style: bold;
+        padding-bottom: 0;
+    }}
+    ConfigurationHomeScreen #saved-config-list {{
+        width: 100%;
+        height: 6;
+        background: {C_BG};
+        border: round {C_BG_HL};
+    }}
+    ConfigurationHomeScreen #saved-config-list:hover {{
+        border: round {C_BLUE};
+    }}
+    ConfigurationHomeScreen #saved-config-list:focus {{
+        border: round {C_CYAN};
+    }}
+    ConfigurationHomeScreen #saved-config-list > ListItem {{
+        height: 2;
+        padding: 0 1;
+        background: {C_BG};
+    }}
+    ConfigurationHomeScreen #saved-config-list > ListItem.-hovered {{
+        background: {C_BG_HL};
+    }}
+    ConfigurationHomeScreen #saved-config-list > ListItem.-highlight {{
+        background: {C_BG_HL};
+    }}
+    ConfigurationHomeScreen #saved-config-list:focus > ListItem.-highlight {{
+        background: {C_BLUE};
+    }}
+    ConfigurationHomeScreen .saved-config-url {{
+        color: {C_FG};
+        text-style: bold;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }}
+    ConfigurationHomeScreen .saved-config-dir {{
+        color: {C_FG_DIM};
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }}
+    ConfigurationHomeScreen #saved-config-list:focus > ListItem.-highlight .saved-config-url,
+    ConfigurationHomeScreen #saved-config-list:focus > ListItem.-highlight .saved-config-dir {{
+        color: {C_BG};
+    }}
+    ConfigurationHomeScreen .active-configuration .saved-config-url {{
+        color: {C_CYAN};
+    }}
+    ConfigurationHomeScreen #saved-config-empty {{
+        color: {C_FG_DIM};
+        background: {C_BG};
+        border: round {C_BG_HL};
+        padding: 1 2;
+    }}
+    ConfigurationHomeScreen #config-home-error {{
+        color: {C_RED};
+        height: auto;
+        min-height: 1;
+        padding-top: 0;
+    }}
+    ConfigurationHomeScreen #config-home-actions {{
+        height: auto;
+        align-horizontal: right;
+        padding-top: 0;
+    }}
+    ConfigurationHomeScreen #config-home-actions Button {{
+        min-width: 18;
+        height: 3;
+        margin-left: 1;
+    }}
+    ConfigurationHomeScreen Button.-style-default {{
+        background: {C_BG_HL} !important;
+        color: {C_FG} !important;
+        border: none !important;
+    }}
+    ConfigurationHomeScreen Button.-style-default.-primary {{
+        background: {C_BLUE} !important;
+        color: {C_BG} !important;
+    }}
+    ConfigurationHomeScreen Button.-style-default:hover {{
+        background: {C_BLUE} !important;
+        color: {C_BG} !important;
+        border: none !important;
+    }}
+    ConfigurationHomeScreen Button.-style-default.-primary:hover {{
+        background: {C_CYAN} !important;
+        border: none !important;
+    }}
+    ConfigurationHomeScreen Button.-style-default:focus {{
+        border: round {C_CYAN} !important;
+        text-style: bold;
+    }}
+    ConfigurationHomeScreen Button.-style-default:disabled {{
+        color: {C_FG_DIM} !important;
+        background: {C_BG} !important;
+        border: none !important;
+    }}
+    """
+
+    def __init__(self, cfg: dict, initial: bool = False):
+        super().__init__()
+        self.cfg = cfg
+        self.initial = initial
+        self._saved_configs = saved_configurations(cfg)
+        active_url = cfg.get("playlist_url", "")
+        active_dir = cfg.get("music_dir", DEFAULTS["music_dir"])
+        self._active_index = next(
+            (
+                index
+                for index, saved in enumerate(self._saved_configs)
+                if saved["playlist_url"] == active_url and saved["music_dir"] == active_dir
+            ),
+            0,
+        )
+
+    def compose(self) -> ComposeResult:
+        cancel_label = "Quit" if self.initial else "Cancel"
+        with Vertical(id="config-home-card"):
+            yield Static("♫  yt-sync", id="config-home-title")
+            yield Static(
+                "Choose a saved playlist and download folder, or create a new one.",
+                id="config-home-subtitle",
+            )
+            yield Label("Saved configurations", id="saved-config-label")
+            if self._saved_configs:
+                items = []
+                for index, saved in enumerate(self._saved_configs):
+                    active = index == self._active_index
+                    url_label = f"{saved['name']}  ·  {saved['playlist_url']}"
+                    if active:
+                        url_label = f"● Active  {url_label}"
+                    items.append(
+                        ListItem(
+                            Static(url_label, classes="saved-config-url", markup=False),
+                            Static(saved["music_dir"], classes="saved-config-dir", markup=False),
+                            id=f"saved-config-{index}",
+                            classes="active-configuration" if active else None,
+                        )
+                    )
+                yield ListView(
+                    *items,
+                    initial_index=self._active_index,
+                    id="saved-config-list",
+                )
+            else:
+                yield Static(
+                    "No saved configurations yet. Create one to begin.",
+                    id="saved-config-empty",
+                )
+            yield Label("", id="config-home-error")
+            with Horizontal(id="config-home-actions"):
+                yield Button(
+                    "Create new configuration",
+                    id="create-configuration",
+                    variant="primary",
+                )
+                yield Button(cancel_label, id="cancel-home")
+
+    def on_mount(self) -> None:
+        if self._saved_configs:
+            self.query_one("#saved-config-list", ListView).focus()
+        else:
+            self.query_one("#create-configuration", Button).focus()
+
+    @on(ListView.Selected)
+    def on_saved_config_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "saved-config-list":
+            return
+        saved = self._saved_configs[event.index]
+        self.dismiss(SetupValues(saved["name"], saved["playlist_url"], saved["music_dir"]))
+
+    @on(Button.Pressed)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "create-configuration":
+            form_cfg = {
+                **self.cfg,
+                "name": "",
+                "playlist_url": "",
+                "music_dir": DEFAULTS["music_dir"],
+            }
+            self.app.push_screen(HomeScreen(form_cfg), self._on_new_configuration)
+        elif event.button.id == "cancel-home":
+            self.dismiss(None)
+
+    def _on_new_configuration(self, values: SetupValues | None) -> None:
+        if values is not None:
+            self.dismiss(values)
+
+    def action_cancel(self) -> None:
+        if self.initial:
+            self.query_one("#config-home-error", Label).update(
+                "Choose a configuration or create one — use Quit to exit without syncing."
+            )
+            if self._saved_configs:
+                self.query_one("#saved-config-list", ListView).focus()
+            else:
+                self.query_one("#create-configuration", Button).focus()
+            return
+        self.dismiss(None)
+
+
+class HomeScreen(ModalScreen):
+    """Creation form for one playlist URL and local download destination."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = f"""
+    HomeScreen {{
+        align: center middle;
+        background: {C_BG} 92%;
+    }}
+    HomeScreen #home-card {{
+        width: 76;
+        max-width: 92%;
+        height: auto;
+        background: {C_BG_DARK};
+        border: round {C_BG_HL};
+        padding: 1 2;
+    }}
+    HomeScreen #home-title {{
+        color: {C_BLUE};
+        text-style: bold;
+        padding-bottom: 0;
+    }}
+    HomeScreen #home-subtitle {{
+        color: {C_FG_DIM};
+        padding-bottom: 1;
+    }}
+    HomeScreen .home-label {{
+        color: {C_FG};
+        text-style: bold;
+        padding-top: 0;
+        padding-bottom: 0;
+    }}
+    HomeScreen Input {{
+        width: 100%;
+        height: 3;
+        background: {C_BG};
+        border: round {C_BG_HL};
+        color: {C_FG};
+    }}
+    HomeScreen Input:hover {{
+        border: round {C_FG_DIM};
+    }}
+    HomeScreen Input:focus {{
+        border: round {C_CYAN};
+        text-style: bold;
+    }}
+    HomeScreen Input:disabled {{
+        color: {C_FG_DIM};
+        background: {C_BG_DARK};
+        border: round {C_BG_HL};
+    }}
+    HomeScreen #destination-row {{
+        width: 100%;
+        height: 3;
+    }}
+    HomeScreen #destination-row Input {{
+        width: 1fr;
+    }}
+    HomeScreen #browse-folder {{
+        width: 14;
+        height: 3;
+        margin-left: 1;
+    }}
+    HomeScreen #home-error {{
+        color: {C_RED};
+        height: auto;
+        min-height: 1;
+        padding-top: 0;
+    }}
+    HomeScreen #home-actions {{
+        height: auto;
+        align-horizontal: right;
+        padding-top: 0;
+    }}
+    HomeScreen #home-actions Button {{
+        min-width: 14;
+        height: 3;
+        margin-left: 1;
+    }}
+    HomeScreen Button.-style-default {{
+        background: {C_BG_HL} !important;
+        color: {C_FG} !important;
+        border: none !important;
+    }}
+    HomeScreen Button.-style-default.-primary {{
+        background: {C_BLUE} !important;
+        color: {C_BG} !important;
+    }}
+    HomeScreen Button.-style-default:hover {{
+        background: {C_BLUE} !important;
+        color: {C_BG} !important;
+        border: none !important;
+    }}
+    HomeScreen Button.-style-default.-primary:hover {{
+        background: {C_CYAN} !important;
+        border: none !important;
+    }}
+    HomeScreen Button.-style-default:focus {{
+        border: round {C_CYAN} !important;
+        text-style: bold;
+    }}
+    HomeScreen Button.-style-default:disabled {{
+        color: {C_FG_DIM} !important;
+        background: {C_BG} !important;
+        border: none !important;
+    }}
+    """
+
+    def __init__(self, cfg: dict, initial: bool = False):
+        super().__init__()
+        self.cfg = cfg
+        self.initial = initial
+
+    def compose(self) -> ComposeResult:
+        cancel_label = "Quit" if self.initial else "Cancel"
+        with Vertical(id="home-card"):
+            yield Static("♫  yt-sync", id="home-title")
+            yield Static(
+                "Create a configuration with one playlist URL and one download folder.",
+                id="home-subtitle",
+            )
+            yield Label("Configuration name", classes="home-label")
+            yield Input(
+                value=self.cfg.get("name", ""),
+                placeholder="e.g. Road trips",
+                id="configuration-name",
+            )
+            yield Label("Playlist URL", classes="home-label")
+            yield Input(
+                value=self.cfg.get("playlist_url", ""),
+                placeholder="https://music.youtube.com/playlist?list=...",
+                id="playlist-url",
+            )
+            yield Label("Download folder", classes="home-label")
+            with Horizontal(id="destination-row"):
+                yield Input(
+                    value=self.cfg.get("music_dir", DEFAULTS["music_dir"]),
+                    placeholder=str(Path.home() / "Music"),
+                    id="music-dir",
+                )
+                yield Button("Browse…", id="browse-folder")
+            yield Label("", id="home-error")
+            with Horizontal(id="home-actions"):
+                yield Button("Start sync", id="start-sync", variant="primary")
+                yield Button(cancel_label, id="cancel-home")
+
+    def on_mount(self) -> None:
+        self.query_one("#configuration-name", Input).focus()
+
+    @on(Input.Submitted)
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "configuration-name":
+            self.query_one("#playlist-url", Input).focus()
+        elif event.input.id == "playlist-url":
+            self.query_one("#music-dir", Input).focus()
+        elif event.input.id == "music-dir":
+            self._submit()
+
+    @on(Button.Pressed)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "browse-folder":
+            self.app.push_screen(
+                DirectoryPickerScreen(self.query_one("#music-dir", Input).value),
+                self._on_folder_picked,
+            )
+        elif event.button.id == "start-sync":
+            self._submit()
+        elif event.button.id == "cancel-home":
+            self.dismiss(None)
+
+    def _on_folder_picked(self, path: Path | None) -> None:
+        if path is None:
+            return
+        destination = self.query_one("#music-dir", Input)
+        destination.value = str(path)
+        destination.focus()
+
+    def _submit(self) -> None:
+        values, error = validate_setup_values(
+            self.query_one("#configuration-name", Input).value,
+            self.query_one("#playlist-url", Input).value,
+            self.query_one("#music-dir", Input).value,
+        )
+        if values is None:
+            self.query_one("#home-error", Label).update(error)
+            return
+        try:
+            Path(values.music_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.query_one("#home-error", Label).update(
+                f"Cannot create destination folder: {exc}"
+            )
+            return
+        self.dismiss(values)
+
+    def action_cancel(self) -> None:
+        if self.initial:
+            self.query_one("#home-error", Label).update(
+                "Setup is still open — use Quit to exit without syncing."
+            )
+            self.query_one("#configuration-name", Input).focus()
+            return
+        self.dismiss(None)
 
 
 class HelpScreen(ModalScreen):
@@ -216,7 +1040,7 @@ class HelpScreen(ModalScreen):
         width: 64;
         max-height: 80%;
         background: {C_BG_DARK};
-        border: thick {C_BLUE};
+        border: round {C_BG_HL};
         padding: 1 2;
     }}
     HelpScreen #help-title {{
@@ -257,12 +1081,14 @@ class HelpScreen(ModalScreen):
             yield Static("  [bold cyan]1[/]            show all tracks", classes="help-row")
             yield Static("  [bold cyan]2[/]            show missing only", classes="help-row")
             yield Static("  [bold cyan]3[/]            show orphans only", classes="help-row")
+            yield Static("  [bold cyan]4[/]            show failed downloads", classes="help-row")
             yield Static("── Actions ──", classes="help-section")
-            yield Static("  [bold cyan]enter[/]        download / trash current row", classes="help-row")
-            yield Static("  [bold cyan]d[/]            batch download (selected / all missing)", classes="help-row")
-            yield Static("  [bold cyan]t[/]            batch trash (selected / all orphans)", classes="help-row")
+            yield Static("  [bold cyan]enter[/]        download / retry / trash current row", classes="help-row")
+            yield Static("  [bold cyan]d[/]            batch download (selected, or all if none)", classes="help-row")
+            yield Static("  [bold cyan]t[/]            batch trash (selected, or all if none)", classes="help-row")
             yield Static("  [bold cyan]x[/]            toggle delete mode (trash ↔ real)", classes="help-row")
             yield Static("  [bold cyan]r[/]            refresh (re-fetch playlist)", classes="help-row")
+            yield Static("  [bold cyan]h[/]            open configurations", classes="help-row")
             yield Static("  [bold cyan]q[/]            quit", classes="help-row")
             yield Static("  [bold cyan]?[/]            this help screen", classes="help-row")
             yield Static("press [bold]esc[/] or [bold]?[/] to close", id="help-footer")
@@ -277,18 +1103,20 @@ class YTSyncApp(App):
     }}
 
     /* ── Header ─────────────────────────────────────────────── */
-    Header {{
+    #app-header {{
         background: {C_BG_DARK};
-        color: {C_BLUE};
+        color: {C_FG};
         dock: top;
         height: 1;
+        padding: 0 1;
+        text-style: bold;
     }}
 
     /* ── Status bar ─────────────────────────────────────────── */
     #status-bar {{
         height: 1;
         dock: top;
-        background: {C_BG_HL};
+        background: {C_BG_DARK};
         color: {C_FG};
         padding: 0 1;
     }}
@@ -301,7 +1129,7 @@ class YTSyncApp(App):
         height: 1;
         dock: top;
         display: none;
-        background: {C_BG_DARK};
+        background: {C_BG_HL};
         color: {C_BLUE};
     }}
     #loader.visible {{
@@ -313,6 +1141,7 @@ class YTSyncApp(App):
         height: 1fr;
         background: {C_BG};
         color: {C_FG};
+        border: round {C_BG_HL};
         scrollbar-color: {C_FG_DIM};
         scrollbar-color-hover: {C_BLUE};
         scrollbar-color-active: {C_CYAN};
@@ -321,10 +1150,12 @@ class YTSyncApp(App):
         background: {C_BG_DARK};
         color: {C_BLUE};
         text-style: bold;
+        border-bottom: solid {C_BG_HL};
     }}
     DataTable > .datatable--cursor {{
         background: {C_BG_HL};
         color: {C_FG};
+        text-style: bold;
     }}
     DataTable > .datatable--even-row {{
         background: {C_BG};
@@ -333,44 +1164,42 @@ class YTSyncApp(App):
         background: {C_BG_DARK};
     }}
     DataTable:focus {{
-        border: tall {C_BLUE};
+        border: round {C_BLUE};
+    }}
+    DataTable:hover {{
+        border: round {C_BLUE};
     }}
 
     /* ── Console ────────────────────────────────────────────── */
     #console {{
-        height: 10;
+        height: 8;
         background: {C_BG_DARK};
         color: {C_FG_DIM};
-        border: tall {C_FG_DIM}40;
+        border: round {C_BG_HL};
         padding: 0 1;
         scrollbar-color: {C_FG_DIM};
         scrollbar-color-hover: {C_BLUE};
     }}
     #console:focus {{
-        border: tall {C_BLUE};
+        border: round {C_BLUE};
     }}
     #console.op-download {{
-        border: tall {C_GREEN};
+        border: round {C_GREEN};
     }}
     #console.op-trash {{
-        border: tall {C_ORANGE};
+        border: round {C_ORANGE};
     }}
     #console.op-refresh {{
-        border: tall {C_CYAN};
+        border: round {C_CYAN};
     }}
 
-    /* ── Footer ─────────────────────────────────────────────── */
-    Footer {{
+    /* ── Persistent filter keys ─────────────────────────────── */
+    #filter-hint {{
+        height: 1;
+        dock: bottom;
         background: {C_BG_DARK};
         color: {C_FG_DIM};
-    }}
-    Footer > .footer--key {{
-        background: {C_BG_HL};
-        color: {C_BLUE};
-        text-style: bold;
-    }}
-    Footer > .footer--description {{
-        color: {C_FG_DIM};
+        padding: 0 1;
     }}
     """
 
@@ -387,11 +1216,13 @@ class YTSyncApp(App):
         Binding("1", "filter_all", "All"),
         Binding("2", "filter_missing", "Missing"),
         Binding("3", "filter_orphans", "Orphans"),
+        Binding("4", "filter_failed", "Failed"),
         Binding("enter", "act_on_current", "Act", show=True),
         Binding("d", "download", "Download"),
         Binding("t", "trash", "Trash"),
         Binding("x", "toggle_delete", "Del-mode"),
         Binding("r", "refresh", "Refresh"),
+        Binding("h", "open_home", "Configurations"),
         Binding("question_mark", "show_help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
@@ -404,15 +1235,15 @@ class YTSyncApp(App):
         self.delete_mode = cfg.get("real_delete", False)
         self.selected: set[str] = set()  # row keys (str indices)
         self._busy = False
-        self._row_map: dict[str, tuple[str, str, str]] = {}  # key -> (title, status, row_type)
+        self._row_map: dict[str, RowEntry] = {}
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Static("♫ yt-sync  ·  YouTube Playlist ↔ Local Music Sync", id="app-header")
         yield Label("", id="status-bar")
         yield LoadingIndicator(id="loader")
         yield DataTable(id="table", zebra_stripes=True)
         yield RichLog(id="console", highlight=True, markup=True)
-        yield Footer()
+        yield Static("1 All · 2 Missing · 3 Orphans · 4 Failed", id="filter-hint")
 
     def on_mount(self) -> None:
         table = self.query_one("#table", DataTable)
@@ -423,7 +1254,59 @@ class YTSyncApp(App):
         del_status = f"[bold {C_RED}]real delete[/]" if self.delete_mode else f"[bold {C_GREEN}]trash[/]"
         self._log(f"  delete mode: {del_status}")
         self._log(f"  press [bold {C_CYAN}]?[/] for keybindings")
+        self._open_home(initial=True)
+
+    def _open_home(self, initial: bool = False) -> None:
+        self.push_screen(
+            ConfigurationHomeScreen(self.cfg, initial=initial),
+            lambda result: self._on_home_result(result, initial),
+        )
+
+    def _on_home_result(self, result: SetupValues | None, initial: bool) -> None:
+        if result is None:
+            if initial:
+                self.exit()
+            return
+
+        previous = {
+            "playlist_url": self.cfg.get("playlist_url", ""),
+            "music_dir": self.cfg.get("music_dir", DEFAULTS["music_dir"]),
+            "saved_configs": list(self.cfg.get("saved_configs", [])),
+        }
+        self.cfg["playlist_url"] = result.playlist_url
+        self.cfg["music_dir"] = result.music_dir
+        self.cfg["saved_configs"] = saved_configurations(
+            {
+                **self.cfg,
+                "saved_configs": [
+                    *self.cfg.get("saved_configs", []),
+                    {
+                        "name": result.name,
+                        "playlist_url": result.playlist_url,
+                        "music_dir": result.music_dir,
+                    },
+                ],
+            }
+        )
+        try:
+            save_config(self.cfg)
+        except OSError as exc:
+            self.cfg.update(previous)
+            self._log(f"[bold {C_RED}]Could not save config: {exc}[/]")
+            self.notify("Could not save setup; please try again", severity="error", timeout=5)
+            self._open_home(initial=initial)
+            return
+
+        self.mode = "all"
+        self.selected.clear()
+        self._log(f"  destination: [bold]{self.cfg['music_dir']}[/]")
         self._do_refresh()
+
+    def action_open_home(self) -> None:
+        if self._busy:
+            self.notify("⏳ Already working…", severity="warning", timeout=2)
+            return
+        self._open_home()
 
     def _log(self, msg: str) -> None:
         self.query_one("#console", RichLog).write(msg)
@@ -465,12 +1348,15 @@ class YTSyncApp(App):
                 scan_local, self.cfg["music_dir"]
             )
             self._log(f"  local:    [bold]{len(local)}[/] files")
-            self.diff_result = diff(playlist, local)
+            self.diff_result = await asyncio.to_thread(
+                build_diff, playlist, local
+            )
             d = self.diff_result
             self._log(
                 f"  result:   [{C_GREEN}]{len(d.matched)} matched[/]  "
                 f"[{C_YELLOW}]{len(d.missing)} missing[/]  "
-                f"[{C_RED}]{len(d.orphans)} orphans[/]"
+                f"[{C_RED}]{len(d.failed)} failed[/]  "
+                f"[{C_ORANGE}]{len(d.orphans)} orphans[/]"
             )
             self.selected.clear()
             self._populate_table()
@@ -492,30 +1378,38 @@ class YTSyncApp(App):
             for t, _f in d.matched:
                 key += 1
                 k = str(key)
-                self._row_map[k] = (t.title, "✔ synced", "matched")
+                self._row_map[k] = RowEntry(t.title, "✔ synced", "matched", track=t)
         if self.mode in ("all", "missing"):
             for t in d.missing:
                 key += 1
                 k = str(key)
-                self._row_map[k] = (t.title, "⬇ missing", "missing")
+                self._row_map[k] = RowEntry(t.title, "⬇ missing", "missing", track=t)
+        if self.mode in ("all", "failed"):
+            for t, err in d.failed:
+                key += 1
+                k = str(key)
+                short = err if len(err) <= 42 else err[:39] + "…"
+                self._row_map[k] = RowEntry(t.title, f"✗ {short}", "failed", track=t)
         if self.mode in ("all", "orphans"):
             for f in d.orphans:
                 key += 1
                 k = str(key)
-                self._row_map[k] = (f.stem, "✗ orphan", "orphan")
+                self._row_map[k] = RowEntry(f.stem, "✗ orphan", "orphan", local=f)
 
-        for k, (title, status, rtype) in self._row_map.items():
-            sel_marker = f"[bold {C_MAGENTA}]▶[/] " if k in self.selected else "  "
+        for k, e in self._row_map.items():
+            sel_marker = self._select_marker(k)
 
             # Color the status text
-            if rtype == "matched":
-                styled_status = f"[{C_GREEN}]{status}[/]"
-            elif rtype == "missing":
-                styled_status = f"[{C_YELLOW}]{status}[/]"
+            if e.row_type == "matched":
+                styled_status = f"[{C_GREEN}]{e.status}[/]"
+            elif e.row_type == "missing":
+                styled_status = f"[{C_YELLOW}]{e.status}[/]"
+            elif e.row_type == "failed":
+                styled_status = f"[{C_RED}]{e.status}[/]"
             else:
-                styled_status = f"[{C_RED}]{status}[/]"
+                styled_status = f"[{C_ORANGE}]{e.status}[/]"
 
-            table.add_row(sel_marker + k, title, styled_status, key=k)
+            table.add_row(sel_marker + k, e.title, styled_status, key=k)
 
         self._update_status_bar()
 
@@ -527,7 +1421,8 @@ class YTSyncApp(App):
         filter_labels = {
             "all": f"[bold {C_BLUE}]ALL[/]",
             "missing": f"[bold {C_YELLOW}]MISSING[/]",
-            "orphans": f"[bold {C_RED}]ORPHANS[/]",
+            "failed": f"[bold {C_RED}]FAILED[/]",
+            "orphans": f"[bold {C_ORANGE}]ORPHANS[/]",
         }
         filter_label = filter_labels.get(self.mode, "ALL")
 
@@ -535,20 +1430,31 @@ class YTSyncApp(App):
             f" {filter_label}"
             f"  [{C_GREEN}]✔ {len(d.matched)}[/]"
             f"  [{C_YELLOW}]⬇ {len(d.missing)}[/]"
-            f"  [{C_RED}]✗ {len(d.orphans)}[/]"
+            f"  [{C_RED}]✗ {len(d.failed)} failed[/]"
+            f"  [{C_ORANGE}]⊘ {len(d.orphans)}[/]"
             f"{sel_info}"
             f"  {del_icon}"
         )
 
     def _key_type(self, key: str) -> str:
         """Map a row key back to its row type."""
-        if key in self._row_map:
-            return self._row_map[key][2]
-        return "matched"
+        e = self._row_map.get(key)
+        return e.row_type if e else "matched"
 
-    def _selected_of_type(self, row_type: str) -> set[str]:
-        """Return selected row keys that belong to the given row_type."""
-        return {k for k in self.selected if self._key_type(k) == row_type}
+    def _select_marker(self, k: str) -> str:
+        return f"[bold {C_MAGENTA}]▶[/] " if k in self.selected else "  "
+
+    def _refresh_select_marker(self, table: DataTable, k: str, row: int) -> None:
+        """Update the ▶ marker in place so cursor and scroll stay put."""
+        table.update_cell_at(Coordinate(row, 0), self._select_marker(k) + k)
+
+    def _row_key_at_cursor(self, table: DataTable) -> str | None:
+        if table.row_count == 0 or table.cursor_row >= len(table.ordered_rows):
+            return None
+        row_key = table.ordered_rows[table.cursor_row].key
+        if row_key is None or row_key.value is None:
+            return None
+        return str(row_key.value)
 
     # ── vim navigation (bypass DataTable text input) ─────────────
     def on_key(self, event: events.Key) -> None:
@@ -563,21 +1469,29 @@ class YTSyncApp(App):
     # ── selection ────────────────────────────────────────────────
     def action_toggle_select(self) -> None:
         table = self.query_one("#table", DataTable)
-        if table.row_count == 0 or table.cursor_row >= len(table.ordered_rows):
+        k = self._row_key_at_cursor(table)
+        if k is None:
             return
-        row_key = table.ordered_rows[table.cursor_row].key
-        if row_key is None or row_key.value is None:
-            return
-        k = str(row_key.value)
         if k in self.selected:
             self.selected.discard(k)
         else:
             self.selected.add(k)
-        self._populate_table()
+        self._refresh_select_marker(table, k, table.cursor_row)
+        self._update_status_bar()
 
     def action_clear_select(self) -> None:
+        if not self.selected:
+            return
+        table = self.query_one("#table", DataTable)
+        previously = set(self.selected)
         self.selected.clear()
-        self._populate_table()
+        for i, row in enumerate(table.ordered_rows):
+            if row.key is None or row.key.value is None:
+                continue
+            k = str(row.key.value)
+            if k in previously:
+                self._refresh_select_marker(table, k, i)
+        self._update_status_bar()
 
     # ── filters ──────────────────────────────────────────────────
     def action_filter_all(self) -> None:
@@ -597,6 +1511,12 @@ class YTSyncApp(App):
         self.selected.clear()
         self._populate_table()
         self.notify("Filter: Orphans only", severity="information", timeout=2)
+
+    def action_filter_failed(self) -> None:
+        self.mode = "failed"
+        self.selected.clear()
+        self._populate_table()
+        self.notify("Filter: Failed only (enter to retry)", severity="information", timeout=2)
 
     def action_refresh(self) -> None:
         self._do_refresh()
@@ -624,18 +1544,15 @@ class YTSyncApp(App):
             self.notify("⏳ Already working…", severity="warning", timeout=2)
             return
         table = self.query_one("#table", DataTable)
-        if table.row_count == 0 or table.cursor_row >= len(table.ordered_rows):
+        k = self._row_key_at_cursor(table)
+        if k is None:
             return
-        row_key = table.ordered_rows[table.cursor_row].key
-        if row_key is None or row_key.value is None:
-            return
-        k = str(row_key.value)
         rtype = self._key_type(k)
 
         if rtype == "matched":
             self.notify("✔ Track is already synced", severity="information", timeout=2)
             return
-        elif rtype == "missing":
+        elif rtype in ("missing", "failed"):
             track = self._track_for_key(k)
             if track:
                 self._busy = True
@@ -652,24 +1569,12 @@ class YTSyncApp(App):
                 self.run_worker(self._do_trash_single(lf), exclusive=True)
 
     def _track_for_key(self, key: str) -> Track | None:
-        """Resolve a row key to the corresponding missing Track."""
-        d = self.diff_result
-        # Calculate the index into d.missing
-        matched_offset = len(d.matched) if self.mode in ("all",) else 0
-        idx = int(key) - 1 - matched_offset
-        if 0 <= idx < len(d.missing):
-            return d.missing[idx]
-        return None
+        e = self._row_map.get(key)
+        return e.track if e else None
 
     def _localfile_for_key(self, key: str) -> LocalFile | None:
-        """Resolve a row key to the corresponding orphan LocalFile."""
-        d = self.diff_result
-        matched_offset = len(d.matched) if self.mode in ("all",) else 0
-        missing_offset = len(d.missing) if self.mode in ("all", "missing") else 0
-        idx = int(key) - 1 - matched_offset - missing_offset
-        if 0 <= idx < len(d.orphans):
-            return d.orphans[idx]
-        return None
+        e = self._row_map.get(key)
+        return e.local if e else None
 
     async def _do_download_single(self, track: Track) -> None:
         """Download a single track."""
@@ -707,9 +1612,13 @@ class YTSyncApp(App):
             self.notify("⏳ Already working…", severity="warning", timeout=2)
             return
         d = self.diff_result
-        # if selection exists, only download selected missing
-        sel = self._selected_of_type("missing")
-        targets = [t for i, t in enumerate(d.missing) if not sel or str(self._missing_key(i)) in sel]
+        # Selection wins: download every selected missing/failed row.
+        # With nothing selected, download all missing (previously-failed
+        # tracks are only retried explicitly). A non-empty selection never
+        # falls back to the full missing list.
+        targets = resolve_download_targets(
+            self.selected, self._row_map, d.missing, d.failed, self.mode
+        )
         if not targets:
             self.notify("Nothing to download", severity="warning", timeout=2)
             self._log(f"[{C_YELLOW}]Nothing to download.[/]")
@@ -718,11 +1627,6 @@ class YTSyncApp(App):
         self._set_loading(True, "download")
         self.notify(f"⬇ Downloading {len(targets)} tracks…", severity="information", timeout=3)
         self.run_worker(self._do_download(targets), exclusive=True)
-
-    def _missing_key(self, idx: int) -> str:
-        """Row key for the idx-th missing track."""
-        base = len(self.diff_result.matched) if self.mode in ("all",) else 0
-        return str(base + idx + 1)
 
     async def _do_download(self, targets: list[Track]) -> None:
         n = len(targets)
@@ -757,8 +1661,7 @@ class YTSyncApp(App):
             self.notify("⏳ Already working…", severity="warning", timeout=2)
             return
         d = self.diff_result
-        sel = self._selected_of_type("orphan")
-        targets = [f for i, f in enumerate(d.orphans) if not sel or str(self._orphan_key(i)) in sel]
+        targets = resolve_trash_targets(self.selected, self._row_map, d.orphans)
         if not targets:
             self.notify("No orphans to act on", severity="warning", timeout=2)
             self._log(f"[{C_YELLOW}]No orphans to act on.[/]")
@@ -768,11 +1671,6 @@ class YTSyncApp(App):
         self._set_loading(True, "trash")
         self.notify(f"{'⊘' if self.delete_mode else '♻'} {verb} {len(targets)} orphans…", severity="information", timeout=3)
         self.run_worker(self._do_trash(targets), exclusive=True)
-
-    def _orphan_key(self, idx: int) -> str:
-        base = len(self.diff_result.matched) if self.mode in ("all",) else 0
-        base += len(self.diff_result.missing)
-        return str(base + idx + 1)
 
     async def _do_trash(self, targets: list[LocalFile]) -> None:
         n = len(targets)
@@ -796,69 +1694,83 @@ class YTSyncApp(App):
 def main() -> None:
     cfg = load_config()
 
-    if not cfg["playlist_url"]:
+    cli_mode = any(
+        flag in sys.argv for flag in ("--diff-only", "--download-only", "--auto")
+    )
+    if cli_mode and not cfg["playlist_url"]:
         print("Error: playlist_url not set in", CONFIG_PATH)
         sys.exit(1)
+
+    if cli_mode:
+        removed = cleanup_stale_artifacts(cfg["music_dir"])
+        if removed:
+            print(f"Cleaned {removed} leftover yt-dlp artifact(s) from music dir.")
 
     if "--diff-only" in sys.argv:
         playlist = fetch_playlist(cfg["playlist_url"])
         local = scan_local(cfg["music_dir"])
-        d = diff(playlist, local)
+        d = build_diff(playlist, local)
         if d.missing:
             print(f"{len(d.missing)} MISSING:")
             for i, t in enumerate(d.missing, 1):
                 print(f"  {i:3d}. {t.title}")
+        if d.failed:
+            print(f"\n{len(d.failed)} FAILED (use --retry-failed to retry):")
+            for i, (t, err) in enumerate(d.failed, 1):
+                print(f"  {i:3d}. {t.title}  [{err}]")
         if d.orphans:
             print(f"\n{len(d.orphans)} ORPHANS (local-only):")
             for i, f in enumerate(d.orphans, 1):
                 print(f"  {i:3d}. {f.stem}")
-        if not d.missing and not d.orphans:
+        if not d.missing and not d.failed and not d.orphans:
             print(f"All {len(d.matched)} tracks synced. Nothing to do.")
         return
 
-    if "--download-only" in sys.argv:
+    if "--download-only" in sys.argv or "--auto" in sys.argv:
         playlist = fetch_playlist(cfg["playlist_url"])
         local = scan_local(cfg["music_dir"])
-        d = diff(playlist, local)
-        if not d.missing:
+        d = build_diff(playlist, local)
+        retry_failed = "--retry-failed" in sys.argv
+
+        targets = list(d.missing)
+        if retry_failed:
+            targets += [t for t, _err in d.failed]
+        if not targets:
             print("Nothing to download.")
-            return
-        print(f"Downloading {len(d.missing)} tracks...")
-        for i, t in enumerate(d.missing, 1):
-            print(f"  [{i}/{len(d.missing)}] {t.title}")
-            result = download_track(t, cfg["music_dir"], cfg["audio_format"])
-            if not result.success:
-                print(f"    FAILED: {result.error}")
-        print("Done.")
-        return
-
-    if "--auto" in sys.argv:
-        playlist = fetch_playlist(cfg["playlist_url"])
-        local = scan_local(cfg["music_dir"])
-        d = diff(playlist, local)
-        if d.missing:
-            print(f"Downloading {len(d.missing)} missing...")
-            for i, t in enumerate(d.missing, 1):
-                print(f"  [{i}/{len(d.missing)}] {t.title}")
-                result = download_track(t, cfg["music_dir"], cfg["audio_format"])
-                if not result.success:
-                    print(f"    FAILED: {result.error}")
-        if d.orphans:
-            print(f"Trashing {len(d.orphans)} orphans...")
-            for i, f in enumerate(d.orphans, 1):
-                print(f"  [{i}/{len(d.orphans)}] {f.stem}")
-                if cfg["real_delete"]:
-                    delete_file(f)
-                else:
-                    trash_file(f, cfg["trash_dir"])
-        if not d.missing and not d.orphans:
-            print("Already synced.")
         else:
-            print("Done.")
+            print(f"Downloading {len(targets)} tracks...")
+            ok = fail = 0
+            for i, t in enumerate(targets, 1):
+                print(f"  [{i}/{len(targets)}] {t.title}")
+                result = download_track(t, cfg["music_dir"], cfg["audio_format"])
+                if result.success:
+                    ok += 1
+                else:
+                    fail += 1
+                    print(f"    FAILED: {result.error}")
+            print(f"Downloads complete: {ok} ok, {fail} failed.")
+        if d.failed and not retry_failed:
+            print(
+                f"Skipped {len(d.failed)} previously-failed "
+                f"(pass --retry-failed to retry): "
+                + ", ".join(t.title for t, _e in d.failed[:5])
+                + ("…" if len(d.failed) > 5 else "")
+            )
+        if "--auto" in sys.argv:
+            if d.orphans:
+                print(f"Trashing {len(d.orphans)} orphans...")
+                for i, f in enumerate(d.orphans, 1):
+                    print(f"  [{i}/{len(d.orphans)}] {f.stem}")
+                    if cfg["real_delete"]:
+                        delete_file(f)
+                    else:
+                        trash_file(f, cfg["trash_dir"])
+                print("Orphans done.")
+            if not d.missing and not d.orphans:
+                print("Already synced.")
         return
 
-    app = YTSyncApp(cfg)
-    app.run()
+    YTSyncApp(cfg).run()
 
 
 if __name__ == "__main__":
