@@ -18,7 +18,8 @@ def generate_mock_local_files(n, music_dir):
         files.append(LocalFile(path=p, stem=p.stem))
     return files
 
-@pytest.mark.benchmark(parametrize=[(100,), (1000,)])
+@pytest.mark.parametrize("param", [(100,), (1000,)])
+@pytest.mark.benchmark
 def test_diff_performance(benchmark, tmp_path, param):
     n = param[0]
     playlist = generate_mock_playlist(n)
@@ -29,7 +30,8 @@ def test_diff_performance(benchmark, tmp_path, param):
 
     assert len(result.matched) > 0
 
-@pytest.mark.benchmark(parametrize=[(100,), (1000,)])
+@pytest.mark.parametrize("param", [(100,), (1000,)])
+@pytest.mark.benchmark
 def test_scan_local_performance(benchmark, tmp_path, param):
     n = param[0]
     generate_mock_local_files(n, tmp_path)
