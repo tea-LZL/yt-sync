@@ -1,0 +1,54 @@
+name: CI Tests
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install textual yt-dlp pytest pytest-benchmark
+
+      - name: Run Functional Tests
+        run: |
+          # Run the existing regression tests
+          pytest ytsync/test_yt_sync.py
+
+      - name: Run Performance Tests
+        run: |
+          # Run performance benchmarks (if test_perf.py exists)
+          if [ -f ytsync/test_perf.py ]; then
+            pytest ytsync/test_perf.py
+          else
+            echo "Performance tests not yet implemented. Skipping."
+          fi
+
+      - name: Run Responsiveness Tests
+        run: |
+          # Run responsiveness checks (if test_responsiveness.py exists)
+          if [ -f ytsync/test_responsiveness.py ]; then
+            pytest ytsync/test_responsiveness.py
+          else
+            echo "Responsiveness tests not yet implemented. Skipping."
+          fi
