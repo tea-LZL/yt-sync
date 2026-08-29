@@ -32,13 +32,13 @@ jobs:
       - name: Run Functional Tests
         run: |
           # Run the existing regression tests
-          pytest ytsync/test_yt_sync.py
+          python -m pytest ytsync/test_yt_sync.py
 
       - name: Run Performance Tests
         run: |
           # Run performance benchmarks (if test_perf.py exists)
           if [ -f ytsync/test_perf.py ]; then
-            pytest ytsync/test_perf.py
+            python -m pytest ytsync/test_perf.py
           else
             echo "Performance tests not yet implemented. Skipping."
           fi
@@ -47,7 +47,7 @@ jobs:
         run: |
           # Run responsiveness checks (if test_responsiveness.py exists)
           if [ -f ytsync/test_responsiveness.py ]; then
-            pytest ytsync/test_responsiveness.py
+            python -m pytest ytsync/test_responsiveness.py
           else
             echo "Responsiveness tests not yet implemented. Skipping."
           fi
