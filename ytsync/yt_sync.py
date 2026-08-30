@@ -594,6 +594,7 @@ class ConfigurationHomeScreen(ModalScreen):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("e", "edit_selected", "Edit"),
+        Binding("enter", "select_selected", "Select"),
     ]
 
     DEFAULT_CSS = f"""
@@ -1045,6 +1046,12 @@ class ConfigurationHomeScreen(ModalScreen):
     def action_edit_selected(self) -> None:
         self._start_edit()
 
+    def action_select_selected(self) -> None:
+        idx = self._selected_index()
+        if idx is not None:
+            saved = self._saved_configs[idx]
+            self.dismiss(SetupValues(saved["name"], saved["playlist_url"], saved["music_dir"]))
+
     def action_cancel(self) -> None:
         if self.initial:
             self.query_one("#config-home-error", Label).update(
@@ -1377,6 +1384,7 @@ class YTSyncApp(App):
         height: 1;
         padding: 0 1;
         text-style: bold;
+        width: 100%;
     }}
 
     /* ── Status bar ─────────────────────────────────────────── */
@@ -1510,6 +1518,7 @@ class YTSyncApp(App):
         yield LoadingIndicator(id="loader")
         yield DataTable(id="table", zebra_stripes=True)
         yield RichLog(id="console", highlight=True, markup=True)
+        yield Static("d: download, t: trash, r: refresh, q: quit", id="hotkey-hint")
         yield Static("1 All · 2 Missing · 3 Orphans · 4 Failed", id="filter-hint")
 
     def on_mount(self) -> None:
