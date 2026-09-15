@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import io
+import sys
 import types
 import tempfile
 import tomllib
@@ -223,6 +225,54 @@ class DownloadDirectoryTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("music directory", result.error)
         run.assert_not_called()
+
+
+class YtDlpInvocationTests(unittest.TestCase):
+    def test_fetch_playlist_runs_yt_dlp_as_the_app_python_module(self):
+        completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch("yt_sync.subprocess.run", return_value=completed) as run:
+            yt_sync.fetch_playlist("https://example.test/list")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], [sys.executable, "-m", "yt_dlp"])
+        self.assertEqual(cmd[-1], "https://example.test/list")
+
+    def test_download_track_runs_yt_dlp_as_the_app_python_module(self):
+        completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        track = Track("new", "New Track", "https://example.test/new")
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("yt_sync.load_failed", return_value={}):
+                with patch("yt_sync.subprocess.run", return_value=completed) as run:
+                    yt_sync.download_track(track, tmp, "opus")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], [sys.executable, "-m", "yt_dlp"])
+        self.assertIn("--embed-thumbnail", cmd)
+        self.assertEqual(cmd[-1], track.url)
+
+
+class RuntimeDependencyTests(unittest.TestCase):
+    def test_reports_missing_python_modules_and_ffmpeg(self):
+        with patch.object(yt_sync.shutil, "which", return_value=None):
+            missing = yt_sync.missing_runtime_dependencies(
+                modules=("textual", "yt_sync_missing_module")
+            )
+        self.assertEqual(missing, ["yt_sync_missing_module", "ffmpeg"])
+        self.assertNotIn("textual", missing)
+
+    def test_dependency_error_points_at_install_script(self):
+        message = yt_sync.format_dependency_error(["mutagen", "ffmpeg"])
+        self.assertIn("mutagen", message)
+        self.assertIn("ffmpeg", message)
+        self.assertIn("./install.sh", message)
+
+    def test_require_runtime_dependencies_exits_when_anything_is_missing(self):
+        stderr = io.StringIO()
+        with patch.object(yt_sync, "missing_runtime_dependencies", return_value=["mutagen"]):
+            with patch.object(sys, "stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    yt_sync.require_runtime_dependencies()
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("./install.sh", stderr.getvalue())
+        self.assertIn("mutagen", stderr.getvalue())
 
 
 class DirectoryPickerTests(unittest.TestCase):

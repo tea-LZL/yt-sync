@@ -5,11 +5,16 @@ YouTube Music playlist ↔ local file sync tool. Fetches a playlist via yt-dlp, 
 ## Install
 
 ```bash
-pip install textual yt-dlp
-# Install ffmpeg with your system package manager as well.
-mkdir -p ~/.config/yt-sync
-ln -s "$PWD/ytsync/yt_sync.py" ~/.local/bin/yt-sync
+./install.sh
 ```
+
+That creates `~/.local/share/yt-sync/venv`, installs `textual` and `yt-dlp[default]`
+(including mutagen, which yt-dlp needs to embed opus thumbnails), and puts
+`yt-sync` on `~/.local/bin`. `ffmpeg` still comes from your package manager;
+the script tells you how to install it if it is missing.
+
+Re-run `./install.sh` after pulling updates. The app also checks for
+`textual`, `yt-dlp`, `mutagen`, and `ffmpeg` at startup.
 
 ## Config
 

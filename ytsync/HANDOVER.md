@@ -6,7 +6,9 @@ Single-file Python TUI (`~/.local/bin/yt-sync` → `/home/tea/repos/music_script
 
 ## Stack
 
-Python 3.11+, Textual, yt-dlp, stdlib (tomllib, difflib, asyncio, subprocess).
+Python 3.11+, Textual, yt-dlp[default] (mutagen), ffmpeg, stdlib (tomllib, difflib, asyncio, subprocess).
+Install with `./install.sh` from the repo root. Runtime calls yt-dlp as
+`sys.executable -m yt_dlp` so mutagen comes from the same environment.
 
 ## Modes
 

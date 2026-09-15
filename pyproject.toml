@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yt-sync"
+version = "0.1.0"
+description = "YouTube Music playlist ↔ local file sync TUI"
+requires-python = ">=3.11"
+dependencies = [
+    "textual",
+    "yt-dlp[default]",
+]
+
+[project.scripts]
+yt-sync = "yt_sync:main"
+
+[tool.setuptools]
+py-modules = ["yt_sync"]
+
+[tool.setuptools.package-dir]
+"" = "ytsync"

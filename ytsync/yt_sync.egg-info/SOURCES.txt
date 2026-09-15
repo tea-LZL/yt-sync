@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+ytsync/yt_sync.py
+ytsync/yt_sync.egg-info/PKG-INFO
+ytsync/yt_sync.egg-info/SOURCES.txt
+ytsync/yt_sync.egg-info/dependency_links.txt
+ytsync/yt_sync.egg-info/entry_points.txt
+ytsync/yt_sync.egg-info/requires.txt
+ytsync/yt_sync.egg-info/top_level.txt
