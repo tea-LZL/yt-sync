@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import io
 import sys
+import time
 import types
 import tempfile
+import threading
 import tomllib
 import unittest
 from pathlib import Path
@@ -14,7 +16,7 @@ from unittest.mock import patch
 
 import yt_sync
 from textual.color import Color
-from textual.widgets import Button, Input, ListView, Static
+from textual.widgets import Button, DataTable, Input, ListView, Static
 from yt_sync import (
     DEFAULTS,
     DiffResult,
@@ -22,9 +24,27 @@ from yt_sync import (
     RowEntry,
     Track,
     YTSyncApp,
+    diff,
     resolve_download_targets,
     resolve_trash_targets,
 )
+
+
+class StateIsolatedMixin:
+    """Point every on-disk state file at a per-test temp dir, never $HOME."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        for attribute, filename in (
+            ("CONFIG_PATH", "config.toml"),
+            ("FAILED_PATH", "failed.json"),
+            ("VIEW_CACHE_PATH", "view-cache.json"),
+        ):
+            previous = getattr(yt_sync, attribute)
+            setattr(yt_sync, attribute, Path(state_dir.name) / filename)
+            self.addCleanup(setattr, yt_sync, attribute, previous)
 
 
 def _sample():
@@ -43,7 +63,7 @@ def _sample():
     return row_map, [m1, m2], [(f1, "err")], [orphan], synced, m1, m2, f1, orphan
 
 
-class SetupValidationTests(unittest.TestCase):
+class SetupValidationTests(StateIsolatedMixin, unittest.TestCase):
     def test_rejects_blank_configuration_name(self):
         values, error = yt_sync.validate_setup_values(
             "  ", "https://example.test/list", "/tmp/music"
@@ -82,7 +102,39 @@ class SetupValidationTests(unittest.TestCase):
         self.assertEqual(error, "Enter a destination folder.")
 
 
-class ConfigPersistenceTests(unittest.TestCase):
+class ConfigPersistenceTests(StateIsolatedMixin, unittest.TestCase):
+    def test_save_config_keeps_the_previous_contents_as_a_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            first = {
+                **DEFAULTS,
+                "playlist_url": "https://example.test/one",
+                "music_dir": str(Path(tmp) / "one"),
+            }
+            second = {**first, "playlist_url": "https://example.test/two"}
+            with patch("yt_sync.CONFIG_PATH", config_path):
+                yt_sync.save_config(dict(first))
+                yt_sync.save_config(dict(second))
+            backup = config_path.with_name("config.toml.bak")
+            self.assertTrue(backup.exists())
+            self.assertIn("https://example.test/one", backup.read_text())
+            self.assertIn("https://example.test/two", config_path.read_text())
+
+    def test_load_config_leaves_an_unreadable_file_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("this is not toml = = =")
+            stderr = io.StringIO()
+            with (
+                patch("yt_sync.CONFIG_PATH", config_path),
+                patch.object(sys, "stderr", stderr),
+            ):
+                cfg = yt_sync.load_config()
+            self.assertEqual(cfg["playlist_url"], DEFAULTS["playlist_url"])
+            self.assertIn("could not read", stderr.getvalue())
+            self.assertTrue(config_path.exists())
+            self.assertIn("this is not toml", config_path.read_text())
+
     def test_save_config_round_trips_setup_values_and_existing_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
@@ -91,6 +143,7 @@ class ConfigPersistenceTests(unittest.TestCase):
                 "playlist_url": "https://music.youtube.com/playlist?list=abc",
                 "music_dir": str(Path(tmp) / "Music"),
                 "real_delete": True,
+                "animations": "basic",
             }
             with patch("yt_sync.CONFIG_PATH", config_path):
                 yt_sync.save_config(cfg)
@@ -98,9 +151,23 @@ class ConfigPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded["playlist_url"], cfg["playlist_url"])
         self.assertEqual(loaded["music_dir"], cfg["music_dir"])
         self.assertTrue(loaded["real_delete"])
+        self.assertEqual(loaded["animations"], "basic")
 
 
-class SavedConfigurationPersistenceTests(unittest.TestCase):
+class StateIsolationTests(StateIsolatedMixin, unittest.TestCase):
+    def test_state_files_never_point_at_the_real_home_directory(self):
+        for path in (
+            yt_sync.CONFIG_PATH,
+            yt_sync.FAILED_PATH,
+            yt_sync.VIEW_CACHE_PATH,
+        ):
+            self.assertTrue(
+                str(path).startswith(tempfile.gettempdir()),
+                f"{path} escapes the per-test temp dir",
+            )
+
+
+class SavedConfigurationPersistenceTests(StateIsolatedMixin, unittest.TestCase):
     def test_save_config_persists_configuration_name(self):
         saved = {
             "name": "Road trips",
@@ -204,7 +271,7 @@ class SavedConfigurationPersistenceTests(unittest.TestCase):
         )
 
 
-class DownloadDirectoryTests(unittest.TestCase):
+class DownloadDirectoryTests(StateIsolatedMixin, unittest.TestCase):
     def test_creates_missing_destination_before_yt_dlp(self):
         with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "nested" / "Music"
@@ -227,7 +294,7 @@ class DownloadDirectoryTests(unittest.TestCase):
         run.assert_not_called()
 
 
-class YtDlpInvocationTests(unittest.TestCase):
+class YtDlpInvocationTests(StateIsolatedMixin, unittest.TestCase):
     def test_fetch_playlist_runs_yt_dlp_as_the_app_python_module(self):
         completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
         with patch("yt_sync.subprocess.run", return_value=completed) as run:
@@ -249,7 +316,7 @@ class YtDlpInvocationTests(unittest.TestCase):
         self.assertEqual(cmd[-1], track.url)
 
 
-class RuntimeDependencyTests(unittest.TestCase):
+class RuntimeDependencyTests(StateIsolatedMixin, unittest.TestCase):
     def test_reports_missing_python_modules_and_ffmpeg(self):
         with patch.object(yt_sync.shutil, "which", return_value=None):
             missing = yt_sync.missing_runtime_dependencies(
@@ -275,7 +342,7 @@ class RuntimeDependencyTests(unittest.TestCase):
         self.assertIn("mutagen", stderr.getvalue())
 
 
-class DirectoryPickerTests(unittest.TestCase):
+class DirectoryPickerTests(StateIsolatedMixin, unittest.TestCase):
     def test_uses_existing_directory_as_picker_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -288,7 +355,7 @@ class DirectoryPickerTests(unittest.TestCase):
             self.assertEqual(yt_sync.nearest_existing_directory(str(new_path)), root)
 
 
-class HomeScreenTests(unittest.IsolatedAsyncioTestCase):
+class HomeScreenTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
     def _app(self, cfg=None):
         cfg = cfg or {
             **DEFAULTS,
@@ -404,7 +471,7 @@ class HomeScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.cfg, original)
 
 
-class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
+class ConfigurationHomeScreenTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
     async def test_configuration_home_keeps_actions_visible_at_compact_terminal_size(self):
         saved = {
             "name": "Compact collection",
@@ -421,6 +488,154 @@ class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cancel.content_region.height, 3)
             self.assertLessEqual(create.region.y + create.region.height, 24)
             self.assertLessEqual(cancel.region.y + cancel.region.height, 24)
+
+    async def test_configuration_home_buttons_carry_keybind_hints(self):
+        saved = {
+            "name": "Library",
+            "playlist_url": "https://example.test/list",
+            "music_dir": "/tmp/library",
+        }
+        cfg = {
+            **DEFAULTS,
+            "playlist_url": saved["playlist_url"],
+            "music_dir": saved["music_dir"],
+            "saved_configs": [saved],
+        }
+        app = YTSyncApp(cfg)
+        app._do_refresh = lambda: None
+
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 40)) as pilot:
+                home = app.screen
+                self.assertIsInstance(home, yt_sync.ConfigurationHomeScreen)
+                self.assertIn("[n]", str(home.query_one("#create-configuration", Button).label))
+                self.assertIn("[e]", str(home.query_one("#edit-configuration", Button).label))
+                self.assertIn("[q]", str(home.query_one("#cancel-home", Button).label))
+
+                await pilot.press("enter")
+                await pilot.pause()
+                dashboard = app.screen
+                await pilot.press("h")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, yt_sync.ConfigurationHomeScreen)
+                self.assertIn("[esc]", str(app.screen.query_one("#cancel-home", Button).label))
+                self.assertIsNot(app.screen, dashboard)
+
+    async def test_configuration_home_hint_line_lists_every_shortcut(self):
+        saved = {
+            "name": "Library",
+            "playlist_url": "https://example.test/list",
+            "music_dir": "/tmp/library",
+        }
+        app = YTSyncApp(
+            {
+                **DEFAULTS,
+                "playlist_url": saved["playlist_url"],
+                "music_dir": saved["music_dir"],
+                "saved_configs": [saved],
+            }
+        )
+        app._do_refresh = lambda: None
+
+        async with app.run_test(size=(100, 40)):
+            hint = app.screen.query_one("#config-home-hint", Static)
+            text = str(hint.render())
+            for token in ("j", "enter", "e", "n", "q"):
+                self.assertIn(token, text)
+            # height: 1 + border-box must leave one visible content line
+            self.assertEqual(hint.content_region.height, 1)
+            self.assertIn("move", app.export_screenshot())
+
+    async def test_j_and_k_move_the_saved_configuration_selection(self):
+        first = {
+            "name": "First",
+            "playlist_url": "https://example.test/first",
+            "music_dir": "/tmp/first",
+        }
+        second = {
+            "name": "Second",
+            "playlist_url": "https://example.test/second",
+            "music_dir": "/tmp/second",
+        }
+        app = YTSyncApp(
+            {
+                **DEFAULTS,
+                "playlist_url": first["playlist_url"],
+                "music_dir": first["music_dir"],
+                "saved_configs": [first, second],
+            }
+        )
+        app._do_refresh = lambda: None
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            home = app.screen
+            saved_list = home.query_one("#saved-config-list", ListView)
+            dashboard_table = app.query_one("#table", DataTable)
+            dashboard_table.add_row("  1", "stale row", "✔", key="1")
+            dashboard_table.move_cursor(row=0)
+            self.assertEqual(saved_list.index, 0)
+
+            await pilot.press("j")
+            await pilot.pause()
+            self.assertEqual(saved_list.index, 1)
+            self.assertEqual(getattr(home.focused, "id", None), "saved-config-list")
+            self.assertEqual(dashboard_table.cursor_row, 0)
+
+            await pilot.press("k")
+            await pilot.pause()
+            self.assertEqual(saved_list.index, 0)
+            self.assertEqual(dashboard_table.cursor_row, 0)
+
+    async def test_n_opens_the_create_configuration_form(self):
+        saved = {
+            "name": "Library",
+            "playlist_url": "https://example.test/list",
+            "music_dir": "/tmp/library",
+        }
+        app = YTSyncApp(
+            {
+                **DEFAULTS,
+                "playlist_url": saved["playlist_url"],
+                "music_dir": saved["music_dir"],
+                "saved_configs": [saved],
+            }
+        )
+        app._do_refresh = lambda: None
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.press("n")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, yt_sync.HomeScreen)
+            self.assertEqual(getattr(app.screen.focused, "id", None), "configuration-name")
+
+    async def test_q_closes_the_configuration_home_without_changing_config(self):
+        active = {
+            "name": "Library",
+            "playlist_url": "https://example.test/list",
+            "music_dir": "/tmp",
+        }
+        cfg = {
+            **DEFAULTS,
+            "playlist_url": active["playlist_url"],
+            "music_dir": active["music_dir"],
+            "saved_configs": [active],
+        }
+        app = YTSyncApp(cfg)
+        app._do_refresh = lambda: None
+        expected = {**cfg, "saved_configs": list(cfg["saved_configs"])}
+
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 40)) as pilot:
+                await pilot.press("enter")
+                await pilot.pause()
+                dashboard = app.screen
+                await pilot.press("h")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, yt_sync.ConfigurationHomeScreen)
+                await pilot.press("q")
+                await pilot.pause()
+                self.assertIs(app.screen, dashboard)
+        self.assertEqual(app.cfg, expected)
 
     async def test_saved_configuration_name_is_the_visible_identity(self):
         saved = {
@@ -681,7 +896,7 @@ class ConfigurationHomeScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.cfg["saved_configs"][0]["name"], "Gym mix")
 
 
-class StartupFlowTests(unittest.IsolatedAsyncioTestCase):
+class StartupFlowTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
     def _app(self, cfg):
         app = YTSyncApp(cfg)
         app._do_refresh = lambda: None
@@ -799,7 +1014,7 @@ class StartupFlowTests(unittest.IsolatedAsyncioTestCase):
         notify.assert_called_once_with("⏳ Already working…", severity="warning", timeout=2)
 
 
-class VisualContractTests(unittest.TestCase):
+class VisualContractTests(StateIsolatedMixin, unittest.TestCase):
     def test_setup_and_configuration_home_have_explicit_interaction_states(self):
         self.assertIn("#home-card", yt_sync.HomeScreen.DEFAULT_CSS)
         self.assertIn("Input:focus", yt_sync.HomeScreen.DEFAULT_CSS)
@@ -816,12 +1031,12 @@ class VisualContractTests(unittest.TestCase):
         self.assertIn("#app-header", YTSyncApp.CSS)
         self.assertIn("#filter-hint", YTSyncApp.CSS)
         self.assertIn("DataTable > .datatable--cursor", YTSyncApp.CSS)
-        self.assertIn("DataTable:hover", YTSyncApp.CSS)
+        self.assertIn("DataTable:focus", YTSyncApp.CSS)
         self.assertIn("border: round", YTSyncApp.CSS)
         self.assertIn("#console", YTSyncApp.CSS)
 
 
-class VisualRuntimeTests(unittest.IsolatedAsyncioTestCase):
+class VisualRuntimeTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
     async def test_primary_buttons_have_their_fill_before_hover(self):
         app = YTSyncApp({**DEFAULTS, "playlist_url": "https://example.test/list"})
         app._do_refresh = lambda: None
@@ -911,7 +1126,7 @@ class VisualRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(table.content_region.width, before)
 
 
-class MainModeTests(unittest.TestCase):
+class MainModeTests(StateIsolatedMixin, unittest.TestCase):
     def test_cli_mode_without_url_keeps_existing_error(self):
         cfg = {**DEFAULTS, "playlist_url": ""}
         with patch("yt_sync.load_config", return_value=cfg):
@@ -931,7 +1146,7 @@ class MainModeTests(unittest.TestCase):
         app_class.return_value.run.assert_called_once_with()
 
 
-class ResolveDownloadTests(unittest.TestCase):
+class ResolveDownloadTests(StateIsolatedMixin, unittest.TestCase):
     def test_empty_selection_downloads_all_missing(self):
         row_map, missing, failed, _orphans, _synced, _m1, _m2, _f1, _orphan = _sample()
         got = resolve_download_targets(set(), row_map, missing, failed, "all")
@@ -964,7 +1179,7 @@ class ResolveDownloadTests(unittest.TestCase):
         self.assertEqual(got, [f1])
 
 
-class ResolveTrashTests(unittest.TestCase):
+class ResolveTrashTests(StateIsolatedMixin, unittest.TestCase):
     def test_empty_selection_trashes_all_orphans(self):
         row_map, _m, _f, orphans, _synced, _m1, _m2, _f1, _orphan = _sample()
         got = resolve_trash_targets(set(), row_map, orphans)
@@ -1006,7 +1221,572 @@ def _stub_refresh(matched, missing, failed=None, orphans=None):
     return _do_refresh
 
 
-class CursorSelectTests(unittest.IsolatedAsyncioTestCase):
+class ActionPipelineTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_single_download_reconciles_without_refetching_playlist(self):
+        track = Track("id1", "Artist - Song", "http://x/1")
+        state = {"downloaded": False}
+
+        def fake_scan(_music_dir):
+            if not state["downloaded"]:
+                return []
+            return [LocalFile(Path("/tmp/Artist - Song.opus"), "Artist - Song")]
+
+        def fake_download(_track, _music_dir, _fmt):
+            state["downloaded"] = True
+            return yt_sync.DownloadResult(success=True)
+
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        with (
+            patch("yt_sync.save_config"),
+            patch("yt_sync.load_failed", return_value={}),
+            patch("yt_sync.fetch_playlist", return_value=[track]) as fetch,
+            patch("yt_sync.scan_local", side_effect=fake_scan),
+            patch("yt_sync.download_track", side_effect=fake_download),
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(fetch.call_count, 1)
+                self.assertEqual(app.query_one("#table").row_count, 1)
+
+                app.action_act_on_current()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+        self.assertEqual(
+            fetch.call_count, 1, "acting on a row must not refetch the playlist"
+        )
+        self.assertEqual([t.id for t, _f in app.diff_result.matched], ["id1"])
+        self.assertEqual(app.diff_result.missing, [])
+        self.assertFalse(app._busy)
+
+    async def test_escape_stops_a_batch_after_the_current_track(self):
+        tracks = [Track(f"id{i}", f"Artist - Song {i}", f"http://x/{i}") for i in range(5)]
+        calls = []
+
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+
+        def fake_download(track, _music_dir, _fmt):
+            calls.append(track.id)
+            app._cancel_requested = True
+            return yt_sync.DownloadResult(success=True)
+
+        with (
+            patch("yt_sync.save_config"),
+            patch("yt_sync.load_failed", return_value={}),
+            patch("yt_sync.fetch_playlist", return_value=tracks),
+            patch("yt_sync.scan_local", return_value=[]),
+            patch("yt_sync.download_track", side_effect=fake_download),
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(len(app.diff_result.missing), 5)
+
+                app.action_download()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+        self.assertEqual(calls, ["id0"], "cancel is checked between tracks")
+        self.assertFalse(app._busy)
+        self.assertFalse(app._batch_active)
+
+    async def test_dashboard_top_rows_do_not_overlap(self):
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = lambda: None
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                header = app.query_one("#app-header")
+                status = app.query_one("#status-bar")
+                slot = app.query_one("#loader-slot")
+                table = app.query_one("#table")
+
+                self.assertEqual(header.region.y, 0)
+                self.assertEqual(status.region.y, header.region.y + header.region.height)
+                self.assertEqual(slot.region.y, status.region.y + status.region.height)
+                self.assertEqual(table.region.y, slot.region.y + slot.region.height)
+                self.assertEqual(status.region.width, header.region.width)
+
+    async def test_spinner_animation_is_idle_unless_an_operation_runs(self):
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = lambda: None
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                loader = app.query_one("#loader")
+                self.assertIsNone(loader.auto_refresh)
+
+                app._set_loading(True, "download")
+                await pilot.pause()
+                self.assertEqual(loader.auto_refresh, 1 / 16)
+                self.assertTrue(loader.has_class("visible"))
+
+                app._set_loading(False)
+                await pilot.pause()
+                self.assertIsNone(loader.auto_refresh)
+                self.assertFalse(loader.has_class("visible"))
+
+    async def test_mouse_moves_over_the_table_do_not_restyle_it(self):
+        from textual.css.stylesheet import Stylesheet
+
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = lambda: None
+        styled_nodes: list[str] = []
+        original_apply = Stylesheet.apply
+
+        def counting_apply(stylesheet, node, *args, **kwargs):
+            styled_nodes.append(getattr(node, "id", type(node).__name__))
+            return original_apply(stylesheet, node, *args, **kwargs)
+
+        with patch("yt_sync.save_config"), patch.object(Stylesheet, "apply", counting_apply):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                app.diff_result = DiffResult(
+                    matched=[], missing=[Track(f"id{i}", f"Artist {i}", "u") for i in range(50)], orphans=[]
+                )
+                app._populate_table()
+                await pilot.pause()
+
+                await pilot.hover("#table", offset=(2, 2))
+                styled_nodes.clear()
+                for row in range(5):
+                    await pilot.hover("#table", offset=(2, 2 + row))
+
+        self.assertLessEqual(
+            styled_nodes.count("table"),
+            1,
+            "a :hover style on DataTable re-applies its stylesheet on every mouse move",
+        )
+
+    async def test_loader_toggle_does_not_move_the_table(self):
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = lambda: None
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                table = app.query_one("#table")
+                loader = app.query_one("#loader")
+                before = table.region
+
+                app._set_loading(True, "download")
+                await pilot.pause()
+                self.assertTrue(loader.has_class("visible"))
+                self.assertEqual(table.region, before)
+
+                app._set_loading(False)
+                await pilot.pause()
+                self.assertFalse(loader.has_class("visible"))
+                self.assertEqual(table.region, before)
+
+    async def test_selection_survives_a_filter_switch(self):
+        lf = LocalFile(Path("/tmp/a.opus"), "Artist - A")
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(
+            _stub_refresh(
+                matched=[(Track("id1", "Artist - A", "http://x/1"), lf)],
+                missing=[
+                    Track("id2", "Artist - B", "http://x/2"),
+                    Track("id3", "Artist - C", "http://x/3"),
+                ],
+            ),
+            app,
+        )
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                table = app.query_one("#table")
+                await pilot.press("j")
+                await pilot.press("space")
+                self.assertEqual(app.selected, {"id2#1"})
+
+                await pilot.press("2")
+                await pilot.pause()
+                self.assertEqual(app.mode, "missing")
+                self.assertEqual(table.row_count, 2)
+                self.assertEqual(app.selected, {"id2#1"}, "selection is not cleared")
+                self.assertIn("▶", str(table.get_row_at(0)[0]))
+                self.assertEqual(app._row_key_at_cursor(table), "id2#1")
+
+                await pilot.press("1")
+                await pilot.pause()
+                self.assertEqual(app.mode, "all")
+                self.assertEqual(app._row_key_at_cursor(table), "id2#1")
+                self.assertEqual(table.cursor_row, 1)
+
+    async def test_duplicate_playlist_entries_get_distinct_row_keys(self):
+        first = Track("same", "Artist - Song", "http://x/1")
+        second = Track("same", "Artist - Song", "http://x/2")
+        lf = LocalFile(Path("/tmp/Artist - Song.opus"), "Artist - Song")
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(
+            _stub_refresh(matched=[(first, lf)], missing=[second]),
+            app,
+        )
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                self.assertEqual(app.query_one("#table").row_count, 2)
+                self.assertEqual(set(app._row_map), {"same#1", "same#2"})
+
+    async def test_large_row_set_commits_without_blocking_the_caller(self):
+        missing = [Track(f"id{i}", f"Artist - Song {i}", f"http://x/{i}") for i in range(2500)]
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(_stub_refresh(matched=[], missing=missing), app)
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                table = app.query_one("#table")
+                table.move_cursor(row=1200)
+
+                started = time.perf_counter()
+                app._populate_table()
+                elapsed = time.perf_counter() - started
+                # Generous vs the ~15 ms local build so slow CI runners still
+                # pass, while a synchronous 2500-row commit (~70 ms local) would
+                # blow well past it on any machine.
+                self.assertLess(elapsed, 0.25, f"filter commit blocked for {elapsed:.3f}s")
+
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(table.row_count, 2500)
+                self.assertEqual(table.cursor_row, 1200)
+
+    async def test_cursor_follows_the_track_when_it_moves_to_matched(self):
+        t1 = Track("id1", "Artist - A", "http://x/1")
+        t2 = Track("id2", "Artist - B", "http://x/2")
+        t3 = Track("id3", "Artist - C", "http://x/3")
+        lf = LocalFile(Path("/tmp/Artist - B.opus"), "Artist - B")
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(_stub_refresh(matched=[(t1, lf)], missing=[t2, t3]), app)
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                table = app.query_one("#table")
+                table.move_cursor(row=1)
+                self.assertEqual(app._row_key_at_cursor(table), "id2#1")
+
+                # id2 finished downloading: it moves from missing to matched.
+                app.diff_result = DiffResult(matched=[(t1, lf), (t2, lf)], missing=[t3], orphans=[])
+                app._populate_table()
+                await pilot.pause()
+
+                self.assertEqual(app._row_key_at_cursor(table), "id2#1")
+                self.assertEqual(table.cursor_row, 1)
+
+    def test_animations_config_maps_to_animation_level(self):
+        for value, expected in (
+            ("none", "none"),
+            ("basic", "basic"),
+            ("full", "full"),
+            ("nonsense", "full"),
+        ):
+            app = YTSyncApp({**DEFAULTS, "animations": value})
+            self.assertEqual(app.animation_level, expected, value)
+
+    async def test_status_bar_shows_batch_progress(self):
+        tracks = [Track(f"id{i}", f"Artist - Song {i}", f"http://x/{i}") for i in range(3)]
+        seen = []
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+
+        def fake_download(track, _music_dir, _fmt):
+            status = str(app.query_one("#status-bar").render())
+            seen.append((app._progress, status))
+            return yt_sync.DownloadResult(success=True)
+
+        with (
+            patch("yt_sync.save_config"),
+            patch("yt_sync.load_failed", return_value={}),
+            patch("yt_sync.fetch_playlist", return_value=tracks),
+            patch("yt_sync.scan_local", return_value=[]),
+            patch("yt_sync.download_track", side_effect=fake_download),
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                app.action_download()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+        self.assertEqual([progress for progress, _s in seen], ["⬇ 1/3", "⬇ 2/3", "⬇ 3/3"])
+        self.assertIn("⬇ 1/3", seen[0][1])
+        self.assertIsNone(app._progress)
+
+    async def test_hidden_selection_warns_instead_of_acting(self):
+        matched = Track("id1", "Artist - A", "http://x/1")
+        missing = Track("id2", "Artist - B", "http://x/2")
+        lf = LocalFile(Path("/tmp/Artist - A.opus"), "Artist - A")
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(_stub_refresh(matched=[(matched, lf)], missing=[missing]), app)
+        with patch("yt_sync.save_config"), patch("yt_sync.download_track") as download:
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                await pilot.press("space")  # select the matched row
+                self.assertEqual(app.selected, {"id1#1"})
+                await pilot.press("2")      # Missing filter hides that selection
+                with patch.object(app, "notify") as notify:
+                    await pilot.press("d")
+                    await pilot.pause()
+                messages = [call.args[0] for call in notify.call_args_list]
+                self.assertTrue(
+                    any("hidden by this filter" in message for message in messages), messages
+                )
+                download.assert_not_called()
+                self.assertFalse(app._busy)
+
+    async def test_stale_large_commit_cannot_wipe_a_newer_populate(self):
+        missing = [Track(f"id{i}", f"Artist - Song {i}", f"http://x/{i}") for i in range(2500)]
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(_stub_refresh(matched=[], missing=missing), app)
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                table = app.query_one("#table")
+
+                app._populate_table()  # schedules the chunked 2500-row commit
+                app.diff_result = DiffResult(
+                    matched=[], missing=[Track("only", "Artist - Only", "http://x/only")], orphans=[]
+                )
+                app._populate_table()  # newer, synchronous populate wins
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+                self.assertEqual(table.row_count, 1)
+                self.assertEqual(set(app._row_map), {"only#1"})
+
+    async def test_refresh_rebuild_keeps_the_cursor_row(self):
+        lf = LocalFile(Path("/tmp/a.opus"), "Artist - A")
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(
+            _stub_refresh(
+                matched=[(Track("id1", "Artist - A", "http://x/1"), lf)],
+                missing=[
+                    Track(f"id{i}", f"Artist - Song {i}", f"http://x/{i}")
+                    for i in range(10)
+                ],
+            ),
+            app,
+        )
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                table = app.query_one("#table")
+                self.assertEqual(table.row_count, 11)
+                table.move_cursor(row=6)
+
+                app._populate_table()
+                await pilot.pause()
+
+                self.assertEqual(table.cursor_row, 6)
+
+
+class DiffPerformanceTests(StateIsolatedMixin, unittest.TestCase):
+    def test_unmatched_diff_stays_within_budget(self):
+        playlist = [Track(f"p{i}", f"Playlist Song {i}", "http://x") for i in range(100)]
+        local = [
+            LocalFile(Path(f"/m/Local Tune {i}.opus"), f"Local Tune {i}")
+            for i in range(1000)
+        ]
+        started = time.perf_counter()
+        result = diff(playlist, local, {})
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(result.missing), 100)
+        self.assertEqual(len(result.orphans), 1000)
+        self.assertLess(elapsed, 2.0, f"unmatched diff took {elapsed:.2f}s")
+
+
+class ViewCacheTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
+    def _cfg(self):
+        return {
+            **DEFAULTS,
+            "playlist_url": "http://example",
+            "music_dir": "/tmp/music",
+            "saved_configs": [],
+        }
+
+    def test_view_cache_round_trips_the_rendered_diff(self):
+        track = Track("id1", "Artist - A", "http://x/1")
+        lf = LocalFile(Path("/tmp/Artist - A.opus"), "Artist - A")
+        payload = DiffResult(
+            matched=[(track, lf)],
+            missing=[Track("id2", "Artist - B", "http://x/2")],
+            orphans=[LocalFile(Path("/tmp/Orphan.opus"), "Orphan")],
+            failed=[(Track("id3", "Artist - C", "http://x/3"), "boom")],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "view-cache.json"
+            with patch.object(yt_sync, "VIEW_CACHE_PATH", path):
+                yt_sync.save_view_cache([track], payload, "http://example", "/tmp/music")
+                loaded = yt_sync.load_view_cache("http://example", "/tmp/music")
+
+                self.assertIsNotNone(loaded)
+                saved_at, got = loaded
+                self.assertGreater(saved_at, 0)
+                self.assertEqual(
+                    [(t.id, str(f.path)) for t, f in got.matched],
+                    [("id1", "/tmp/Artist - A.opus")],
+                )
+                self.assertEqual([t.id for t in got.missing], ["id2"])
+                self.assertEqual([str(f.path) for f in got.orphans], ["/tmp/Orphan.opus"])
+                self.assertEqual([(t.id, err) for t, err in got.failed], [("id3", "boom")])
+                self.assertIsNone(yt_sync.load_view_cache("other", "/tmp/music"))
+
+    async def test_cached_view_paints_before_network_and_pauses_actions(self):
+        cfg = self._cfg()
+        cached = DiffResult(
+            matched=[],
+            missing=[Track("cached1", "Artist - Cached", "http://x/c")],
+            orphans=[],
+        )
+        fresh = [Track("new", "Artist - New", "http://x/n")]
+        fetch_calls = {"n": 0}
+        gate = threading.Event()
+
+        def fetch(_url):
+            fetch_calls["n"] += 1
+            if fetch_calls["n"] == 1:
+                gate.wait(timeout=5)
+                raise RuntimeError("offline")
+            return fresh
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "view-cache.json"
+            with (
+                patch.object(yt_sync, "VIEW_CACHE_PATH", path),
+                patch("yt_sync.save_config"),
+                patch("yt_sync.load_failed", return_value={}),
+                patch("yt_sync.fetch_playlist", side_effect=fetch),
+                patch("yt_sync.scan_local", return_value=[]),
+            ):
+                yt_sync.save_view_cache(
+                    cached.missing, cached, cfg["playlist_url"], cfg["music_dir"]
+                )
+                app = YTSyncApp(cfg)
+                async with app.run_test(size=(100, 30)) as pilot:
+                    app.screen.dismiss(
+                        yt_sync.SetupValues("Library", cfg["playlist_url"], cfg["music_dir"])
+                    )
+                    await pilot.pause()
+                    table = app.query_one("#table")
+                    self.assertEqual(table.row_count, 1)
+                    self.assertEqual(app._row_map["cached1#1"].title, "Artist - Cached")
+                    self.assertTrue(app._stale)
+                    self.assertIn("cached", str(app.query_one("#status-bar").render()))
+
+                    with (
+                        patch("yt_sync.download_track") as download,
+                        patch.object(app, "notify") as notify,
+                    ):
+                        await pilot.press("d")
+                        await pilot.pause()
+                    download.assert_not_called()
+                    self.assertTrue(
+                        any(
+                            "Refreshing" in call.args[0]
+                            for call in notify.call_args_list
+                        )
+                    )
+
+                    gate.set()
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    self.assertTrue(app._stale, "a failed refresh keeps the cached view")
+                    self.assertEqual(table.row_count, 1)
+                    self.assertEqual(app._stale_error, "offline")
+                    self.assertIn(
+                        "refresh failed — r to retry",
+                        str(app.query_one("#status-bar").render()),
+                    )
+
+                    with patch.object(app, "notify") as notify_failed:
+                        await pilot.press("d")
+                        await pilot.pause()
+                    self.assertTrue(
+                        any(
+                            "press r to retry" in call.args[0]
+                            for call in notify_failed.call_args_list
+                        )
+                    )
+
+                    await pilot.press("r")
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    self.assertFalse(app._stale)
+                    self.assertIsNone(app._stale_error)
+                    self.assertEqual(set(app._row_map), {"new#1"})
+
+    async def test_corrupt_view_cache_is_ignored(self):
+        cfg = self._cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "view-cache.json"
+            path.write_text("{not valid json")
+            with (
+                patch.object(yt_sync, "VIEW_CACHE_PATH", path),
+                patch("yt_sync.save_config"),
+                patch("yt_sync.load_failed", return_value={}),
+                patch("yt_sync.fetch_playlist", return_value=[]),
+                patch("yt_sync.scan_local", return_value=[]),
+            ):
+                app = YTSyncApp(cfg)
+                async with app.run_test(size=(100, 30)) as pilot:
+                    app.screen.dismiss(
+                        yt_sync.SetupValues("Library", cfg["playlist_url"], cfg["music_dir"])
+                    )
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    self.assertFalse(app._stale)
+                    self.assertEqual(app.query_one("#table").row_count, 0)
+
+    async def test_successful_refresh_replaces_the_cached_view(self):
+        cfg = self._cfg()
+        cached = DiffResult(
+            matched=[],
+            missing=[Track("old", "Artist - Old", "http://x/o")],
+            orphans=[],
+        )
+        fresh = [Track("new", "Artist - New", "http://x/n")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "view-cache.json"
+            with (
+                patch.object(yt_sync, "VIEW_CACHE_PATH", path),
+                patch("yt_sync.save_config"),
+                patch("yt_sync.load_failed", return_value={}),
+                patch("yt_sync.fetch_playlist", return_value=fresh),
+                patch("yt_sync.scan_local", return_value=[]),
+            ):
+                yt_sync.save_view_cache(
+                    cached.missing, cached, cfg["playlist_url"], cfg["music_dir"]
+                )
+                app = YTSyncApp(cfg)
+                async with app.run_test(size=(100, 30)) as pilot:
+                    app.screen.dismiss(
+                        yt_sync.SetupValues("Library", cfg["playlist_url"], cfg["music_dir"])
+                    )
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    self.assertFalse(app._stale)
+                    self.assertEqual(set(app._row_map), {"new#1"})
+                    self.assertNotIn("cached", str(app.query_one("#status-bar").render()))
+                    stored = yt_sync.load_view_cache(cfg["playlist_url"], cfg["music_dir"])
+                    self.assertEqual([t.id for t in stored[1].missing], ["new"])
+
+
+class CursorSelectTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
     async def test_space_keeps_cursor_on_toggled_row(self):
         lf = LocalFile(Path("/tmp/a.opus"), "Artist - A")
         app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
@@ -1036,12 +1816,12 @@ class CursorSelectTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     table.cursor_row, 1, "space must not jump the cursor to row 0"
                 )
-                self.assertEqual(app.selected, {"2"})
+                self.assertEqual(app.selected, {"id2#1"})
 
                 await pilot.press("j")
                 await pilot.press("space")
                 self.assertEqual(table.cursor_row, 2)
-                self.assertEqual(app.selected, {"2", "3"})
+                self.assertEqual(app.selected, {"id2#1", "id3#1"})
 
                 # Mixed selection: matched row 0 + missing. Download must not
                 # fall back to every missing track (id4 is unselected).
@@ -1053,6 +1833,42 @@ class CursorSelectTests(unittest.IsolatedAsyncioTestCase):
                     app.mode,
                 )
                 self.assertEqual([t.id for t in targets], ["id2", "id3"])
+
+    async def test_g_and_shift_g_jump_to_list_ends(self):
+        app = YTSyncApp({**DEFAULTS, "playlist_url": "http://example", "music_dir": "/tmp"})
+        app._do_refresh = types.MethodType(
+            _stub_refresh(
+                matched=[],
+                missing=[
+                    Track(f"id{i}", f"Artist - Song {i}", f"http://x/{i}")
+                    for i in range(4)
+                ],
+            ),
+            app,
+        )
+        with patch("yt_sync.save_config"):
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.screen.dismiss(yt_sync.SetupValues("Library", "http://example", "/tmp"))
+                await pilot.pause()
+                table = app.query_one("#table")
+                self.assertEqual(table.row_count, 4)
+                self.assertEqual(table.cursor_row, 0)
+
+                await pilot.press("G")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 3)
+
+                await pilot.press("g")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 0)
+
+                await pilot.press("k")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 0, "cursor clamps at the top")
+
+                await pilot.press("j")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 1)
 
 
 if __name__ == "__main__":

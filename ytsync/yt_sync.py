@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
+import importlib.util
 import json
 import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,12 +28,14 @@ DEFAULTS = {
     "trash_dir": str(Path.home() / ".local" / "share" / "yt-sync" / "trash"),
     "real_delete": False,
     "theme": "textual-dark",
+    "animations": "full",
     "saved_configs": [],
 }
 
 AUDIO_EXTS = {".opus", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".wav", ".webm"}
 STATE_DIR = Path.home() / ".local" / "share" / "yt-sync"
 FAILED_PATH = STATE_DIR / "failed.json"
+VIEW_CACHE_PATH = STATE_DIR / "view-cache.json"
 REQUIRED_PYTHON_MODULES = ("textual", "yt_dlp", "mutagen")
 
 
@@ -42,8 +45,10 @@ def missing_runtime_dependencies(
     missing: list[str] = []
     for name in modules:
         try:
-            importlib.import_module(name)
-        except ImportError:
+            found = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
             missing.append(name)
     if shutil.which("ffmpeg") is None:
         missing.append("ffmpeg")
@@ -137,8 +142,18 @@ def prune_failed(failed: dict[str, dict], valid_ids: set[str]) -> int:
 def load_config() -> dict:
     cfg = {**DEFAULTS, "saved_configs": []}
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, "rb") as f:
-            section = tomllib.load(f).get("yt-sync", {})
+        try:
+            with open(CONFIG_PATH, "rb") as f:
+                section = tomllib.load(f).get("yt-sync", {})
+        except (tomllib.TOMLDecodeError, OSError) as exc:
+            # Never silently replace an unreadable config: leave it in place and
+            # let save_config keep a .bak before the next write.
+            print(
+                f"Warning: could not read {CONFIG_PATH}: {exc}. "
+                "Using defaults; the file is left untouched and backed up on save.",
+                file=sys.stderr,
+            )
+            return cfg
         if isinstance(section, dict):
             cfg.update({key: value for key, value in section.items() if key != "saved_configs"})
             cfg["saved_configs"] = section.get("saved_configs", [])
@@ -162,6 +177,7 @@ def save_config(cfg: dict) -> None:
         f"trash_dir = {quote(cfg.get('trash_dir', DEFAULTS['trash_dir']))}",
         f"real_delete = {'true' if cfg.get('real_delete', False) else 'false'}",
         f"theme = {quote(cfg.get('theme', DEFAULTS['theme']))}",
+        f"animations = {quote(cfg.get('animations', DEFAULTS['animations']))}",
     ]
     for saved in cfg["saved_configs"]:
         lines.extend(
@@ -174,6 +190,19 @@ def save_config(cfg: dict) -> None:
             ]
         )
     content = "\n".join(lines) + "\n"
+    if CONFIG_PATH.exists():
+        # Keep the previous contents so an accidental overwrite stays recoverable.
+        try:
+            previous = CONFIG_PATH.read_text(encoding="utf-8")
+        except OSError:
+            previous = None
+        if previous is not None and previous != content:
+            try:
+                CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.bak").write_text(
+                    previous, encoding="utf-8"
+                )
+            except OSError:
+                pass
     temporary_path = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.tmp")
     temporary_path.write_text(content, encoding="utf-8")
     temporary_path.replace(CONFIG_PATH)
@@ -385,13 +414,19 @@ def build_diff(playlist: list[Track], local: list[LocalFile]) -> DiffResult:
 def diff(playlist: list[Track], local: list[LocalFile],
          failed_map: dict[str, dict] | None = None) -> DiffResult:
     failed_map = failed_map or {}
-    norm_local = {normalize(f.stem): f for f in local}
+    # Normalize each local stem once; the fuzzy loop used to repeat this for
+    # every (playlist, local) pair.
+    norms = {f.path: normalize(f.stem) for f in local}
+    norm_local: dict[str, LocalFile] = {}
+    for f in local:
+        norm_local[norms[f.path]] = f
     title_index: dict[str, LocalFile] = {}
     for f in local:
         if " - " in f.stem:
             parts = f.stem.rsplit(" - ", 1)
             title_index[normalize(parts[1])] = f
 
+    matchers: dict[Path, SequenceMatcher] = {}
     matched: list[tuple[Track, LocalFile]] = []
     missing: list[Track] = []
     failed: list[tuple[Track, str]] = []
@@ -409,10 +444,27 @@ def diff(playlist: list[Track], local: list[LocalFile],
         else:
             best = None
             best_ratio = 0.0
+            nt_len = len(nt)
             for f in local:
                 if f.path in used:
                     continue
-                ratio = SequenceMatcher(None, nt, normalize(f.stem)).ratio()
+                na = norms[f.path]
+                na_len = len(na)
+                # Cheap safe gates first. SequenceMatcher ratio can never exceed
+                # the length bound or quick_ratio, so skipping a pair whose bound
+                # is <= 0.85 cannot change the > 0.85 outcome.
+                shorter = nt_len if nt_len <= na_len else na_len
+                if 40 * shorter <= 17 * (nt_len + na_len):
+                    continue
+                # SequenceMatcher caches the b-side index, so one matcher per
+                # local file avoids rebuilding it for every playlist entry.
+                matcher = matchers.get(f.path)
+                if matcher is None:
+                    matcher = matchers[f.path] = SequenceMatcher(None, None, na)
+                matcher.set_seq1(nt)
+                if matcher.quick_ratio() <= 0.85:
+                    continue
+                ratio = matcher.ratio()
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best = f
@@ -426,6 +478,97 @@ def diff(playlist: list[Track], local: list[LocalFile],
 
     orphans = [f for f in local if f.path not in used]
     return DiffResult(matched=matched, missing=missing, orphans=orphans, failed=failed)
+
+
+# ── last-view cache (stale-while-revalidate) ────────────────────────
+VIEW_CACHE_MAX_ENTRIES = 8
+
+
+def _view_cache_key(playlist_url: str, music_dir: str) -> str:
+    return f"{playlist_url}\n{music_dir}"
+
+
+def _track_fields(raw: object) -> tuple[str, str, str]:
+    if not isinstance(raw, list) or len(raw) < 3:
+        raise TypeError("malformed cached track")
+    return str(raw[0]), str(raw[1]), str(raw[2])
+
+
+def load_view_cache(
+    playlist_url: str, music_dir: str
+) -> tuple[float, DiffResult] | None:
+    """Return (saved_at, diff) for this configuration, or None if unavailable."""
+    try:
+        data = json.loads(VIEW_CACHE_PATH.read_text())
+        entry = data[_view_cache_key(playlist_url, music_dir)]
+        diff = entry["diff"]
+        matched = [
+            (
+                Track(*_track_fields(raw[:3])),
+                LocalFile(Path(str(raw[3])), Path(str(raw[3])).stem),
+            )
+            for raw in diff["matched"]
+        ]
+        missing = [Track(*_track_fields(raw)) for raw in diff["missing"]]
+        failed = [
+            (Track(*_track_fields(raw[:3])), str(raw[3])) for raw in diff["failed"]
+        ]
+        orphans = [LocalFile(Path(str(path)), Path(str(path)).stem) for path in diff["orphans"]]
+        return float(entry.get("saved_at", 0.0)), DiffResult(
+            matched, missing, orphans, failed
+        )
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
+def save_view_cache(
+    playlist: list[Track], d: DiffResult, playlist_url: str, music_dir: str
+) -> None:
+    """Persist the rendered view so the next start can paint before the network."""
+    entry = {
+        "saved_at": time.time(),
+        "diff": {
+            "matched": [
+                [t.id, t.title, t.url, str(f.path)] for t, f in d.matched
+            ],
+            "missing": [[t.id, t.title, t.url] for t in d.missing],
+            "failed": [[t.id, t.title, t.url, err] for t, err in d.failed],
+            "orphans": [str(f.path) for f in d.orphans],
+        },
+    }
+    try:
+        data: dict = {}
+        if VIEW_CACHE_PATH.exists():
+            try:
+                loaded = json.loads(VIEW_CACHE_PATH.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}
+        data[_view_cache_key(playlist_url, music_dir)] = entry
+        if len(data) > VIEW_CACHE_MAX_ENTRIES:
+            newest = sorted(
+                data.items(),
+                key=lambda item: (
+                    item[1].get("saved_at", 0) if isinstance(item[1], dict) else 0
+                ),
+                reverse=True,
+            )[:VIEW_CACHE_MAX_ENTRIES]
+            data = dict(newest)
+        VIEW_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = VIEW_CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(VIEW_CACHE_PATH)
+    except OSError:
+        pass
+
+
+def format_cache_age(seconds: float) -> str:
+    if seconds < 45:
+        return "just now"
+    if seconds < 90 * 60:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.1f}h"
 
 
 # ── actions ─────────────────────────────────────────────────────────
@@ -492,11 +635,11 @@ from textual.widgets import (  # noqa: E402
     Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView,
     LoadingIndicator, RichLog, Static,
 )
-from textual.containers import Horizontal, Vertical  # noqa: E402
+from textual.containers import Container, Horizontal, Vertical  # noqa: E402
 from textual.binding import Binding  # noqa: E402
 from textual.coordinate import Coordinate  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
-from textual import events, on  # noqa: E402
+from textual import on  # noqa: E402
 
 # ── Colors ──────────────────────────────────────────────────────────
 # Semantic slate palette: surfaces stay quiet; status colors carry meaning.
@@ -567,6 +710,7 @@ class DirectoryPickerScreen(ModalScreen):
         background: {C_BG_HL};
         color: {C_FG};
         border: none !important;
+        transition: background 90ms out_cubic, color 90ms out_cubic;
     }}
     DirectoryPickerScreen Button.-style-default.-primary {{
         background: {C_BLUE} !important;
@@ -629,8 +773,12 @@ class ConfigurationHomeScreen(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
+        Binding("q", "quit_home", "Quit", show=False),
         Binding("e", "edit_selected", "Edit"),
+        Binding("n", "new_configuration", "New", show=False),
         Binding("enter", "select_selected", "Select"),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
     ]
 
     DEFAULT_CSS = f"""
@@ -666,6 +814,7 @@ class ConfigurationHomeScreen(ModalScreen):
         height: 6;
         background: {C_BG};
         border: round {C_BG_HL};
+        transition: border 90ms out_cubic;
     }}
     ConfigurationHomeScreen #saved-config-list:hover {{
         border: round {C_BLUE};
@@ -677,6 +826,7 @@ class ConfigurationHomeScreen(ModalScreen):
         height: 2;
         padding: 0 1;
         background: {C_BG};
+        transition: background 90ms out_cubic;
     }}
     ConfigurationHomeScreen #saved-config-list > ListItem.-hovered {{
         background: {C_BG_HL};
@@ -753,10 +903,17 @@ class ConfigurationHomeScreen(ModalScreen):
         height: 3;
         margin-left: 1;
     }}
+    ConfigurationHomeScreen #config-home-hint {{
+        height: 1;
+        color: {C_FG_DIM};
+        content-align: center middle;
+        margin-top: 1;
+    }}
     ConfigurationHomeScreen Button.-style-default {{
         background: {C_BG_HL} !important;
         color: {C_FG} !important;
         border: none !important;
+        transition: background 90ms out_cubic, color 90ms out_cubic;
     }}
     ConfigurationHomeScreen Button.-style-default.-primary {{
         background: {C_BLUE} !important;
@@ -841,16 +998,27 @@ class ConfigurationHomeScreen(ModalScreen):
             yield Label("", id="config-home-error")
             with Horizontal(id="config-home-actions"):
                 yield Button(
-                    "Create new configuration",
+                    "New configuration  \\[n]",
                     id="create-configuration",
                     variant="primary",
                 )
                 yield Button(
-                    "Edit",
+                    "Edit  \\[e]",
                     id="edit-configuration",
                     disabled=not bool(self._saved_configs),
                 )
-                yield Button(cancel_label, id="cancel-home")
+                yield Button(
+                    f"{cancel_label}  \\[{'q' if self.initial else 'esc'}]",
+                    id="cancel-home",
+                )
+            quit_hint = "q" if self.initial else "esc"
+            quit_verb = "quit" if self.initial else "cancel"
+            key = lambda text: f"[bold {C_CYAN}]{text}[/]"  # noqa: E731
+            yield Static(
+                f"{key('↑↓/jk')} move · {key('enter')} open · {key('e')} edit"
+                f" · {key('n')} new · {key(quit_hint)} {quit_verb}",
+                id="config-home-hint",
+            )
 
     def on_mount(self) -> None:
         if self._saved_configs:
@@ -956,24 +1124,27 @@ class ConfigurationHomeScreen(ModalScreen):
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "create-configuration":
-            form_cfg = {
-                **self.cfg,
-                "name": "",
-                "playlist_url": "",
-                "music_dir": DEFAULTS["music_dir"],
-            }
-            self.app.push_screen(
-                HomeScreen(
-                    form_cfg,
-                    existing_configs=self._saved_configs,
-                    edit_index=None,
-                ),
-                self._on_new_configuration,
-            )
+            self._open_create_form()
         elif event.button.id == "edit-configuration":
             self._start_edit()
         elif event.button.id == "cancel-home":
             self.dismiss(None)
+
+    def _open_create_form(self) -> None:
+        form_cfg = {
+            **self.cfg,
+            "name": "",
+            "playlist_url": "",
+            "music_dir": DEFAULTS["music_dir"],
+        }
+        self.app.push_screen(
+            HomeScreen(
+                form_cfg,
+                existing_configs=self._saved_configs,
+                edit_index=None,
+            ),
+            self._on_new_configuration,
+        )
 
     def _start_edit(self) -> None:
         idx = self._selected_index()
@@ -1079,6 +1250,34 @@ class ConfigurationHomeScreen(ModalScreen):
             pass
         self._editing_index = None
 
+    def _saved_list(self) -> ListView | None:
+        try:
+            return self.query_one("#saved-config-list", ListView)
+        except Exception:
+            return None
+
+    def _move_selection(self, delta: int) -> None:
+        """Move the highlighted configuration and pull focus back to the list."""
+        list_view = self._saved_list()
+        if list_view is None or not self._saved_configs:
+            return
+        list_view.focus()
+        current = list_view.index if list_view.index is not None else 0
+        last = len(self._saved_configs) - 1
+        list_view.index = max(0, min(last, current + delta))
+
+    def action_cursor_down(self) -> None:
+        self._move_selection(1)
+
+    def action_cursor_up(self) -> None:
+        self._move_selection(-1)
+
+    def action_new_configuration(self) -> None:
+        self._open_create_form()
+
+    def action_quit_home(self) -> None:
+        self.dismiss(None)
+
     def action_edit_selected(self) -> None:
         self._start_edit()
 
@@ -1140,6 +1339,7 @@ class HomeScreen(ModalScreen):
         background: {C_BG};
         border: round {C_BG_HL};
         color: {C_FG};
+        transition: border 90ms out_cubic;
     }}
     HomeScreen Input:hover {{
         border: round {C_FG_DIM};
@@ -1185,6 +1385,7 @@ class HomeScreen(ModalScreen):
         background: {C_BG_HL} !important;
         color: {C_FG} !important;
         border: none !important;
+        transition: background 90ms out_cubic, color 90ms out_cubic;
     }}
     HomeScreen Button.-style-default.-primary {{
         background: {C_BLUE} !important;
@@ -1412,11 +1613,19 @@ class YTSyncApp(App):
         background: {C_BG};
     }}
 
+    /* ── Top bar ─────────────────────────────────────────────── */
+    /* Textual anchors every same-edge dock at row 0 and reserves only the
+       tallest one, so header, status and spinner must share one docked box. */
+    #top-bar {{
+        dock: top;
+        height: 3;
+        width: 100%;
+    }}
+
     /* ── Header ─────────────────────────────────────────────── */
     #app-header {{
         background: {C_BG_DARK};
         color: {C_FG};
-        dock: top;
         height: 1;
         padding: 0 1;
         text-style: bold;
@@ -1426,19 +1635,22 @@ class YTSyncApp(App):
     /* ── Status bar ─────────────────────────────────────────── */
     #status-bar {{
         height: 1;
-        dock: top;
         background: {C_BG_DARK};
         color: {C_FG};
         padding: 0 1;
+        width: 100%;
     }}
     #status-bar.busy {{
         color: {C_YELLOW};
     }}
 
     /* ── Loading indicator ──────────────────────────────────── */
+    #loader-slot {{
+        height: 1;
+        width: 100%;
+    }}
     #loader {{
         height: 1;
-        dock: top;
         display: none;
         background: {C_BG_HL};
         color: {C_BLUE};
@@ -1453,6 +1665,7 @@ class YTSyncApp(App):
         background: {C_BG};
         color: {C_FG};
         border: round {C_BG_HL};
+        transition: border 90ms out_cubic;
         scrollbar-color: {C_FG_DIM};
         scrollbar-color-hover: {C_BLUE};
         scrollbar-color-active: {C_CYAN};
@@ -1477,9 +1690,10 @@ class YTSyncApp(App):
     DataTable:focus {{
         border: round {C_BLUE};
     }}
-    DataTable:hover {{
-        border: round {C_BLUE};
-    }}
+    /* No hover style on the table: Textual re-applies a widget's stylesheet on
+       every mouse move over it when it has :hover rules (~2-4 ms/move at 3000
+       rows, freezing the loop during cursor travel). Focus keeps the border
+       cue; the row cursor already shows where the mouse points. */
 
     /* ── Console ────────────────────────────────────────────── */
     #console {{
@@ -1544,16 +1758,31 @@ class YTSyncApp(App):
         self.diff_result = DiffResult(matched=[], missing=[], orphans=[])
         self.mode = "all"
         self.delete_mode = cfg.get("real_delete", False)
-        self.selected: set[str] = set()  # row keys (str indices)
+        self.selected: set[str] = set()  # row keys (track identity, not position)
         self._busy = False
         self._row_map: dict[str, RowEntry] = {}
+        self._row_numbers: dict[str, int] = {}
+        self._row_generation = 0
+        self._playlist: list[Track] | None = None
+        self._cancel_requested = False
+        self._batch_active = False
+        self._stale = False
+        self._cache_age: str | None = None
+        self._stale_error: str | None = None
+        self._progress: str | None = None
+        level = str(cfg.get("animations", "full")).lower()
+        self.animation_level = level if level in {"full", "basic", "none"} else "full"
 
     def compose(self) -> ComposeResult:
-        yield Static("♫ yt-sync  ·  YouTube Playlist ↔ Local Music Sync", id="app-header")
-        yield Label("", id="status-bar")
-        yield LoadingIndicator(id="loader")
+        with Vertical(id="top-bar"):
+            yield Static(
+                "♫ yt-sync  ·  YouTube Playlist ↔ Local Music Sync", id="app-header"
+            )
+            yield Label("", id="status-bar")
+            with Container(id="loader-slot"):
+                yield LoadingIndicator(id="loader")
         yield DataTable(id="table", zebra_stripes=True)
-        yield RichLog(id="console", highlight=True, markup=True)
+        yield RichLog(id="console", highlight=False, markup=True, max_lines=1000)
         yield Static("d: download, t: trash, r: refresh, q: quit", id="hotkey-hint")
         yield Static("1 All · 2 Missing · 3 Orphans · 4 Failed", id="filter-hint")
 
@@ -1562,6 +1791,9 @@ class YTSyncApp(App):
         table.cursor_type = "row"
         table.add_columns("", "Title", "Status")
         table.focus()
+        # The spinner enables its own 16 fps refresh on mount; keep it idle until
+        # an operation actually shows it.
+        self.query_one("#loader", LoadingIndicator).auto_refresh = None
         self._log(f"[bold {C_BLUE}]♫ yt-sync ready[/]")
         del_status = f"[bold {C_RED}]real delete[/]" if self.delete_mode else f"[bold {C_GREEN}]trash[/]"
         self._log(f"  delete mode: {del_status}")
@@ -1611,7 +1843,13 @@ class YTSyncApp(App):
 
         self.mode = "all"
         self.selected.clear()
+        if previous["playlist_url"] != self.cfg["playlist_url"]:
+            self._playlist = None
+        self._stale = False
+        self._cache_age = None
+        self._stale_error = None
         self._log(f"  destination: [bold]{self.cfg['music_dir']}[/]")
+        self._restore_cached_view()
         self._do_refresh()
 
     def action_open_home(self) -> None:
@@ -1629,33 +1867,67 @@ class YTSyncApp(App):
         console = self.query_one("#console", RichLog)
         if on:
             loader.add_class("visible")
+            # LoadingIndicator sets auto_refresh = 1/16 on mount and never stops;
+            # only animate while the spinner is actually on screen.
+            loader.auto_refresh = 1 / 16
             console.remove_class("op-download", "op-trash", "op-refresh")
             if op:
                 console.add_class(f"op-{op}")
             self.query_one("#status-bar", Label).add_class("busy")
         else:
             loader.remove_class("visible")
+            loader.auto_refresh = None
             console.remove_class("op-download", "op-trash", "op-refresh")
             self.query_one("#status-bar", Label).remove_class("busy")
 
     # ── non-blocking data load ──────────────────────────────────
+    def _restore_cached_view(self) -> bool:
+        """Paint the last rendered view immediately; actions stay paused."""
+        if not self.cfg.get("playlist_url"):
+            return False
+        cached = load_view_cache(self.cfg["playlist_url"], self.cfg["music_dir"])
+        if cached is None:
+            return False
+        saved_at, diff = cached
+        self.diff_result = diff
+        self.selected.clear()
+        self._stale = True
+        self._stale_error = None
+        self._cache_age = format_cache_age(max(0.0, time.time() - saved_at))
+        self._log(
+            f"[dim]Showing cached view ({self._cache_age} old) while refreshing…[/]"
+        )
+        self._populate_table()
+        return True
+
     def _do_refresh(self) -> None:
         """Kick off a non-blocking data load."""
         if self._busy:
             self._log(f"[{C_YELLOW}]Already working…[/]")
             return
         self._busy = True
+        self._cancel_requested = False
+        self._stale_error = None
         self._set_loading(True, "refresh")
         self._log(f"[dim]Fetching playlist…[/]")
         self.run_worker(self._async_load_data(), exclusive=True)
 
-    async def _async_load_data(self) -> None:
-        """Fetch playlist and scan local files off the main thread."""
+    async def _async_load_data(self, fetch: bool = True) -> None:
+        """Load playlist and local files off the main thread.
+
+        `fetch=False` reuses the cached playlist so actions only pay for a
+        local rescan and the diff, not a yt-dlp round trip.
+        """
         try:
-            playlist = await asyncio.to_thread(
-                fetch_playlist, self.cfg["playlist_url"]
-            )
-            self._log(f"  playlist: [bold]{len(playlist)}[/] tracks")
+            if fetch or self._playlist is None:
+                playlist = await asyncio.to_thread(
+                    fetch_playlist, self.cfg["playlist_url"]
+                )
+                self._playlist = playlist
+                self._log(f"  playlist: [bold]{len(playlist)}[/] tracks")
+            else:
+                playlist = self._playlist
+                self._log(f"  playlist: [bold]{len(playlist)}[/] tracks (cached)")
             local = await asyncio.to_thread(
                 scan_local, self.cfg["music_dir"]
             )
@@ -1671,59 +1943,163 @@ class YTSyncApp(App):
                 f"[{C_ORANGE}]{len(d.orphans)} orphans[/]"
             )
             self.selected.clear()
+            self._stale = False
+            self._cache_age = None
+            self._stale_error = None
             self._populate_table()
+            try:
+                await asyncio.to_thread(
+                    save_view_cache,
+                    playlist,
+                    self.diff_result,
+                    self.cfg["playlist_url"],
+                    self.cfg["music_dir"],
+                )
+            except Exception:
+                pass
         except Exception as e:
             self._log(f"[bold {C_RED}]Error: {e}[/]")
+            if self._stale:
+                self._stale_error = str(e) or "refresh failed"
+                self._log(
+                    f"[dim]Keeping the cached view; press r to retry.[/]"
+                )
+                self._update_status_bar()
         finally:
             self._busy = False
             self._set_loading(False)
 
-    def _populate_table(self) -> None:
-        table = self.query_one("#table", DataTable)
-        table.clear()
-        self._row_map.clear()
+    # ── row commit ──────────────────────────────────────────────
+    _ROW_COMMIT_SYNC = 1000
+    _ROW_CHUNK = 500
+
+    def _build_row_model(self) -> list[tuple[str, int, str, str]]:
+        """Build (key, display number, title, styled status) rows in display order.
+
+        Keys are stable per playlist entry (`<track id>#<occurrence>`) so a
+        filter switch keeps selection and cursor anchored to the same tracks;
+        orphan rows key off their path.
+        """
         d = self.diff_result
+        keyed: list[tuple[str, Track | None, LocalFile | None, str, str, str]] = []
+        counts: dict[str, int] = {}
 
-        key = 0
-
-        if self.mode in ("all",):
-            for t, _f in d.matched:
-                key += 1
-                k = str(key)
-                self._row_map[k] = RowEntry(t.title, "✔ synced", "matched", track=t)
-        if self.mode in ("all", "missing"):
-            for t in d.missing:
-                key += 1
-                k = str(key)
-                self._row_map[k] = RowEntry(t.title, "⬇ missing", "missing", track=t)
-        if self.mode in ("all", "failed"):
-            for t, err in d.failed:
-                key += 1
-                k = str(key)
-                short = err if len(err) <= 42 else err[:39] + "…"
-                self._row_map[k] = RowEntry(t.title, f"✗ {short}", "failed", track=t)
-        if self.mode in ("all", "orphans"):
-            for f in d.orphans:
-                key += 1
-                k = str(key)
-                self._row_map[k] = RowEntry(f.stem, "✗ orphan", "orphan", local=f)
-
-        for k, e in self._row_map.items():
-            sel_marker = self._select_marker(k)
-
-            # Color the status text
-            if e.row_type == "matched":
-                styled_status = f"[{C_GREEN}]{e.status}[/]"
-            elif e.row_type == "missing":
-                styled_status = f"[{C_YELLOW}]{e.status}[/]"
-            elif e.row_type == "failed":
-                styled_status = f"[{C_RED}]{e.status}[/]"
+        def add(
+            track: Track | None,
+            local: LocalFile | None,
+            status: str,
+            row_type: str,
+        ) -> None:
+            if track is not None:
+                counts[track.id] = counts.get(track.id, 0) + 1
+                key = f"{track.id}#{counts[track.id]}"
+                title = track.title
             else:
-                styled_status = f"[{C_ORANGE}]{e.status}[/]"
+                key = str(local.path)
+                title = local.stem
+            keyed.append((key, track, local, title, status, row_type))
 
-            table.add_row(sel_marker + k, e.title, styled_status, key=k)
+        for t, _f in d.matched:
+            add(t, None, "✔ synced", "matched")
+        for t in d.missing:
+            add(t, None, "⬇ missing", "missing")
+        for t, err in d.failed:
+            short = err if len(err) <= 42 else err[:39] + "…"
+            add(t, None, f"✗ {short}", "failed")
+        for f in d.orphans:
+            add(None, f, "✗ orphan", "orphan")
 
+        wanted = {
+            "all": ("matched", "missing", "failed", "orphan"),
+            "missing": ("missing",),
+            "failed": ("failed",),
+            "orphans": ("orphan",),
+        }.get(self.mode, ("matched", "missing", "failed", "orphan"))
+
+        self._row_map.clear()
+        self._row_numbers.clear()
+        rows: list[tuple[str, int, str, str]] = []
+        for key, track, local, title, status, row_type in keyed:
+            if row_type not in wanted:
+                continue
+            number = len(rows) + 1
+            self._row_map[key] = RowEntry(title, status, row_type, track=track, local=local)
+            self._row_numbers[key] = number
+            color = {"matched": C_GREEN, "missing": C_YELLOW, "failed": C_RED}.get(
+                row_type, C_ORANGE
+            )
+            rows.append((key, number, title, f"[{color}]{status}[/]"))
+        return rows
+
+    def _populate_table(self) -> None:
+        """Rebuild rows from the current diff, in one batch or chunked off-frame."""
+        rows = self._build_row_model()
+        table = self.query_one("#table", DataTable)
+        cursor_key = self._row_key_at_cursor(table)
+        cursor_row = table.cursor_row if table.row_count else 0
+        scroll_y = table.scroll_offset.y
+        self._row_generation += 1
+        generation = self._row_generation
+
+        if len(rows) <= self._ROW_COMMIT_SYNC:
+            with self.batch_update():
+                table.clear()
+                for key, number, title, status in rows:
+                    table.add_row(
+                        f"{self._select_marker(key)}{number}", title, status, key=key
+                    )
+            self._restore_table_position(cursor_key, cursor_row, scroll_y)
+        else:
+            self.run_worker(
+                self._commit_rows(rows, generation, cursor_key, cursor_row, scroll_y),
+                group="rows",
+                exclusive=True,
+            )
         self._update_status_bar()
+
+    async def _commit_rows(
+        self,
+        rows: list[tuple[str, int, str, str]],
+        generation: int,
+        cursor_key: str | None,
+        cursor_row: int,
+        scroll_y: int,
+    ) -> None:
+        """Insert large row sets in chunks so no single slice blows the frame."""
+        table = self.query_one("#table", DataTable)
+        if generation != self._row_generation:
+            return
+        with self.batch_update():
+            table.clear()
+        for start in range(0, len(rows), self._ROW_CHUNK):
+            if generation != self._row_generation:
+                return
+            with self.batch_update():
+                for key, number, title, status in rows[start : start + self._ROW_CHUNK]:
+                    table.add_row(
+                        f"{self._select_marker(key)}{number}", title, status, key=key
+                    )
+            await asyncio.sleep(0)
+        if generation == self._row_generation:
+            self._restore_table_position(cursor_key, cursor_row, scroll_y)
+
+    def _restore_table_position(
+        self, cursor_key: str | None, cursor_row: int, scroll_y: int
+    ) -> None:
+        """Keep the cursor on the same row identity when it survives the rebuild."""
+        table = self.query_one("#table", DataTable)
+        if not table.row_count:
+            return
+        row = None
+        if cursor_key is not None:
+            try:
+                row = table.get_row_index(cursor_key)
+            except Exception:
+                row = None
+        if row is None:
+            row = min(cursor_row, table.row_count - 1)
+        table.move_cursor(row=row)
+        table.scroll_to(y=scroll_y, animate=False)
 
     def _update_status_bar(self) -> None:
         d = self.diff_result
@@ -1737,9 +2113,19 @@ class YTSyncApp(App):
             "orphans": f"[bold {C_ORANGE}]ORPHANS[/]",
         }
         filter_label = filter_labels.get(self.mode, "ALL")
+        stale_marker = ""
+        if self._stale:
+            age = self._cache_age or "earlier"
+            if self._stale_error:
+                stale_marker = (
+                    f"  [{C_RED}]cached {age} · refresh failed — r to retry[/]"
+                )
+            else:
+                stale_marker = f"  [{C_YELLOW}]cached {age} · refreshing…[/]"
+        progress_marker = f"  [{C_CYAN}]{self._progress}[/]" if self._progress else ""
 
         self.query_one("#status-bar", Label).update(
-            f" {filter_label}"
+            f" {filter_label}{stale_marker}{progress_marker}"
             f"  [{C_GREEN}]✔ {len(d.matched)}[/]"
             f"  [{C_YELLOW}]⬇ {len(d.missing)}[/]"
             f"  [{C_RED}]✗ {len(d.failed)} failed[/]"
@@ -1758,7 +2144,10 @@ class YTSyncApp(App):
 
     def _refresh_select_marker(self, table: DataTable, k: str, row: int) -> None:
         """Update the ▶ marker in place so cursor and scroll stay put."""
-        table.update_cell_at(Coordinate(row, 0), self._select_marker(k) + k)
+        number = self._row_numbers.get(k)
+        if number is None:
+            return
+        table.update_cell_at(Coordinate(row, 0), f"{self._select_marker(k)}{number}")
 
     def _row_key_at_cursor(self, table: DataTable) -> str | None:
         if table.row_count == 0 or table.cursor_row >= len(table.ordered_rows):
@@ -1768,15 +2157,37 @@ class YTSyncApp(App):
             return None
         return str(row_key.value)
 
-    # ── vim navigation (bypass DataTable text input) ─────────────
-    def on_key(self, event: events.Key) -> None:
-        table = self.query_one("#table", DataTable)
-        if event.key == "j":
-            table.action_cursor_down()
-            event.prevent_default()
-        elif event.key == "k":
-            table.action_cursor_up()
-            event.prevent_default()
+    # ── vim navigation ───────────────────────────────────────────
+    # Declared in BINDINGS, so dispatch happens before any focused widget
+    # sees the key; modal screens own their keys.
+    def _dashboard_table(self) -> DataTable:
+        return self.query_one("#table", DataTable)
+
+    def action_cursor_down(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._dashboard_table().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._dashboard_table().action_cursor_up()
+
+    def action_scroll_home(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        table = self._dashboard_table()
+        if table.row_count:
+            table.move_cursor(row=0)
+            table.scroll_home(animate=False)
+
+    def action_scroll_end(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        table = self._dashboard_table()
+        if table.row_count:
+            table.move_cursor(row=table.row_count - 1)
+            table.scroll_end(animate=False)
 
     # ── selection ────────────────────────────────────────────────
     def action_toggle_select(self) -> None:
@@ -1792,6 +2203,13 @@ class YTSyncApp(App):
         self._update_status_bar()
 
     def action_clear_select(self) -> None:
+        if self._batch_active:
+            self._cancel_requested = True
+            self.notify("Stopping after the current track…", severity="warning", timeout=2)
+            return
+        if self._busy:
+            self.notify("⏳ Waiting for the current operation…", severity="warning", timeout=2)
+            return
         if not self.selected:
             return
         table = self.query_one("#table", DataTable)
@@ -1808,25 +2226,21 @@ class YTSyncApp(App):
     # ── filters ──────────────────────────────────────────────────
     def action_filter_all(self) -> None:
         self.mode = "all"
-        self.selected.clear()
         self._populate_table()
         self.notify("Filter: All tracks", severity="information", timeout=2)
 
     def action_filter_missing(self) -> None:
         self.mode = "missing"
-        self.selected.clear()
         self._populate_table()
         self.notify("Filter: Missing only", severity="information", timeout=2)
 
     def action_filter_orphans(self) -> None:
         self.mode = "orphans"
-        self.selected.clear()
         self._populate_table()
         self.notify("Filter: Orphans only", severity="information", timeout=2)
 
     def action_filter_failed(self) -> None:
         self.mode = "failed"
-        self.selected.clear()
         self._populate_table()
         self.notify("Filter: Failed only (enter to retry)", severity="information", timeout=2)
 
@@ -1852,6 +2266,9 @@ class YTSyncApp(App):
     # ── single-item action (enter key) ───────────────────────────
     def action_act_on_current(self) -> None:
         """Download or trash the track under the cursor."""
+        if self._stale:
+            self.notify(self._stale_action_message(), severity="warning", timeout=4)
+            return
         if self._busy:
             self.notify("⏳ Already working…", severity="warning", timeout=2)
             return
@@ -1880,6 +2297,15 @@ class YTSyncApp(App):
                 self.notify(f"{'⊘' if self.delete_mode else '♻'} {verb}: {lf.stem}", severity="information", timeout=3)
                 self.run_worker(self._do_trash_single(lf), exclusive=True)
 
+    def _stale_action_message(self) -> str:
+        if self._stale_error:
+            return "Refresh failed — press r to retry"
+        return "Refreshing — actions resume in a moment"
+
+    def _selection_hidden_by_filter(self) -> bool:
+        """True when rows are selected but none of them survive the current filter."""
+        return bool(self.selected) and not (self.selected & self._row_map.keys())
+
     def _track_for_key(self, key: str) -> Track | None:
         e = self._row_map.get(key)
         return e.track if e else None
@@ -1889,7 +2315,7 @@ class YTSyncApp(App):
         return e.local if e else None
 
     async def _do_download_single(self, track: Track) -> None:
-        """Download a single track."""
+        """Download a single track, then reconcile locally (no playlist refetch)."""
         self._log(f"  [{C_CYAN}]⬇[/] {track.title}")
         result = await asyncio.to_thread(
             download_track, track, self.cfg["music_dir"], self.cfg["audio_format"]
@@ -1900,12 +2326,10 @@ class YTSyncApp(App):
         else:
             self._log(f"    [{C_RED}]✗ {result.error}[/]")
             self.notify(f"✗ Failed: {result.error}", severity="error", timeout=5)
-        self._busy = False
-        self._set_loading(False)
-        await self._async_load_data()
+        await self._async_load_data(fetch=False)
 
     async def _do_trash_single(self, lf: LocalFile) -> None:
-        """Trash or delete a single orphan."""
+        """Trash or delete a single orphan, then reconcile locally."""
         verb = "Deleting" if self.delete_mode else "Trashing"
         self._log(f"  [{C_ORANGE}]{'⊘' if self.delete_mode else '♻'}[/] {verb} {lf.stem}")
         if self.delete_mode:
@@ -1914,12 +2338,13 @@ class YTSyncApp(App):
             await asyncio.to_thread(trash_file, lf, self.cfg["trash_dir"])
         self._log(f"    [{C_GREEN}]✔ done[/]")
         self.notify(f"✔ {verb[:-3]}ed: {lf.stem}", severity="information", timeout=3)
-        self._busy = False
-        self._set_loading(False)
-        await self._async_load_data()
+        await self._async_load_data(fetch=False)
 
     # ── batch download (async, non-blocking) ─────────────────────
     def action_download(self) -> None:
+        if self._stale:
+            self.notify(self._stale_action_message(), severity="warning", timeout=4)
+            return
         if self._busy:
             self.notify("⏳ Already working…", severity="warning", timeout=2)
             return
@@ -1932,8 +2357,18 @@ class YTSyncApp(App):
             self.selected, self._row_map, d.missing, d.failed, self.mode
         )
         if not targets:
-            self.notify("Nothing to download", severity="warning", timeout=2)
-            self._log(f"[{C_YELLOW}]Nothing to download.[/]")
+            if self._selection_hidden_by_filter():
+                self.notify(
+                    "Selected rows are hidden by this filter — press 1 for All",
+                    severity="warning",
+                    timeout=4,
+                )
+                self._log(
+                    f"[{C_YELLOW}]Selection is hidden by the current filter (press 1).[/]"
+                )
+            else:
+                self.notify("Nothing to download", severity="warning", timeout=2)
+                self._log(f"[{C_YELLOW}]Nothing to download.[/]")
             return
         self._busy = True
         self._set_loading(True, "download")
@@ -1944,39 +2379,68 @@ class YTSyncApp(App):
         n = len(targets)
         ok_count = 0
         fail_count = 0
-        self._log(f"[bold {C_BLUE}]Downloading {n} tracks…[/]")
-        for i, t in enumerate(targets, 1):
-            self._log(f"  [{C_FG_DIM}][{i}/{n}][/] {t.title}")
-            result = await asyncio.to_thread(
-                download_track, t, self.cfg["music_dir"], self.cfg["audio_format"]
-            )
-            if result.success:
-                self._log(f"    [{C_GREEN}]✔ downloaded[/]")
-                ok_count += 1
-            else:
-                self._log(f"    [{C_RED}]✗ {result.error}[/]")
-                fail_count += 1
+        self._batch_active = True
+        self._cancel_requested = False
+        try:
+            self._log(f"[bold {C_BLUE}]Downloading {n} tracks…[/]")
+            for i, t in enumerate(targets, 1):
+                if self._cancel_requested:
+                    self._log(f"[{C_YELLOW}]Stopped after {i - 1}/{n}.[/]")
+                    break
+                self._progress = f"⬇ {i}/{n}"
+                self._update_status_bar()
+                self._log(f"  [{C_FG_DIM}][{i}/{n}][/] {t.title}")
+                result = await asyncio.to_thread(
+                    download_track, t, self.cfg["music_dir"], self.cfg["audio_format"]
+                )
+                if result.success:
+                    self._log(f"    [{C_GREEN}]✔ downloaded[/]")
+                    ok_count += 1
+                else:
+                    self._log(f"    [{C_RED}]✗ {result.error}[/]")
+                    fail_count += 1
+        finally:
+            self._batch_active = False
+            self._progress = None
         # Summary
         summary = f"[bold {C_GREEN}]Downloads complete:[/] {ok_count} ok"
         if fail_count:
             summary += f", [{C_RED}]{fail_count} failed[/]"
+        if self._cancel_requested:
+            summary += f" [{C_YELLOW}](stopped at {ok_count + fail_count}/{n})[/]"
         self._log(summary)
-        severity = "information" if fail_count == 0 else "warning"
-        self.notify(f"Done: {ok_count} downloaded, {fail_count} failed", severity=severity, timeout=5)
-        self._busy = False
-        self._set_loading(False)
-        await self._async_load_data()
+        severity = "information" if fail_count == 0 and not self._cancel_requested else "warning"
+        self.notify(
+            f"Done: {ok_count} downloaded, {fail_count} failed"
+            + (f" (stopped at {ok_count + fail_count}/{n})" if self._cancel_requested else ""),
+            severity=severity,
+            timeout=5,
+        )
+        await self._async_load_data(fetch=False)
 
     # ── batch trash (async) ──────────────────────────────────────
     def action_trash(self) -> None:
+        if self._stale:
+            self.notify(self._stale_action_message(), severity="warning", timeout=4)
+            return
         if self._busy:
             self.notify("⏳ Already working…", severity="warning", timeout=2)
             return
         d = self.diff_result
         targets = resolve_trash_targets(self.selected, self._row_map, d.orphans)
         if not targets:
-            self.notify("No orphans to act on", severity="warning", timeout=2)
-            self._log(f"[{C_YELLOW}]No orphans to act on.[/]")
+            if self._selection_hidden_by_filter():
+                self.notify(
+                    "Selected rows are hidden by this filter — press 1 for All",
+                    severity="warning",
+                    timeout=4,
+                )
+                self._log(
+                    f"[{C_YELLOW}]Selection is hidden by the current filter (press 1).[/]"
+                )
+            else:
+                self.notify("No orphans to act on", severity="warning", timeout=2)
+                self._log(f"[{C_YELLOW}]No orphans to act on.[/]")
             return
         self._busy = True
         verb = "Deleting" if self.delete_mode else "Trashing"
@@ -1987,19 +2451,34 @@ class YTSyncApp(App):
     async def _do_trash(self, targets: list[LocalFile]) -> None:
         n = len(targets)
         verb = "Deleting" if self.delete_mode else "Trashing"
-        self._log(f"[bold {C_ORANGE}]{verb} {n} orphans…[/]")
-        for i, f in enumerate(targets, 1):
-            self._log(f"  [{C_FG_DIM}][{i}/{n}][/] {f.stem}")
-            if self.delete_mode:
-                await asyncio.to_thread(delete_file, f)
-            else:
-                await asyncio.to_thread(trash_file, f, self.cfg["trash_dir"])
-            self._log(f"    [{C_GREEN}]✔ done[/]")
-        self._log(f"[bold {C_GREEN}]{verb} complete.[/]")
-        self.notify(f"✔ {verb} {n} orphans complete", severity="information", timeout=3)
-        self._busy = False
-        self._set_loading(False)
-        await self._async_load_data()
+        self._batch_active = True
+        self._cancel_requested = False
+        done = 0
+        try:
+            self._log(f"[bold {C_ORANGE}]{verb} {n} orphans…[/]")
+            for i, f in enumerate(targets, 1):
+                if self._cancel_requested:
+                    self._log(f"[{C_YELLOW}]Stopped after {done}/{n}.[/]")
+                    break
+                icon = "⊘" if self.delete_mode else "♻"
+                self._progress = f"{icon} {i}/{n}"
+                self._update_status_bar()
+                self._log(f"  [{C_FG_DIM}][{i}/{n}][/] {f.stem}")
+                if self.delete_mode:
+                    await asyncio.to_thread(delete_file, f)
+                else:
+                    await asyncio.to_thread(trash_file, f, self.cfg["trash_dir"])
+                done += 1
+                self._log(f"    [{C_GREEN}]✔ done[/]")
+        finally:
+            self._batch_active = False
+            self._progress = None
+        if self._cancel_requested:
+            self.notify(f"Stopped: {verb.lower()} {done}/{n} orphans", severity="warning", timeout=4)
+        else:
+            self._log(f"[bold {C_GREEN}]{verb} complete.[/]")
+            self.notify(f"✔ {verb} {n} orphans complete", severity="information", timeout=3)
+        await self._async_load_data(fetch=False)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────

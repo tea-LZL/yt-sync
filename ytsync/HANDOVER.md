@@ -46,6 +46,9 @@ music_dir = "/home/tea/Music/Youtube Music"
 audio_format = "opus"
 real_delete = false
 theme = "textual-dark"
+# "full" (default), "basic" (no CSS transitions) or "none" (no transitions, static
+# spinner). Use basic/none for tmux or ssh sessions with a slow link.
+animations = "full"
 
 # Each saved entry has a visible name plus URL + directory.
 [[yt-sync.saved_configs]]
@@ -83,20 +86,40 @@ active playlist URL. The TUI uses a high-contrast dark slate palette, explicit
 focus/hover states, stable first rendering, and an operational loader. The
 dashboard keeps `1 All`, `2 Missing`, `3 Orphans`, and `4 Failed` visible as a
 persistent filter hint. Escape keeps the initial configuration home open;
-explicit Quit exits it and is reachable with Tab followed by Enter.
+explicit Quit exits it and is reachable with Tab followed by Enter. Every
+configuration-home action shows its shortcut in the button label — `New
+configuration [n]`, `Edit [e]`, and `Quit [q]` (initial) or `Cancel [esc]`
+(later) — with a hint line beneath the buttons (`↑↓/jk move · enter open · e
+edit · n new · q quit`). `j`/`k` (or the arrow keys) move the saved list, `enter`
+opens the highlighted entry, `n` opens the create form from anywhere on the
+home, and `q` quits from the initial home or cancels a later one.
 
 Downloads use yt-dlp to embed metadata and the thumbnail in the audio file.
 Output files follow `Artist - Song name.opus` (or the configured audio format).
 
 ## TUI keybindings
 
+### Configuration home
+
+| Key | Action |
+|-----|--------|
+| `j`/`k`, arrows | move the saved-configuration highlight |
+| `enter` | open (activate) the highlighted configuration |
+| `n` | create a new configuration |
+| `e` | edit the highlighted configuration |
+| `q` | quit (initial home) / cancel a later home |
+| `escape` | back; on the initial home it keeps the chooser open with a reminder |
+| `tab`/`shift+tab` | move focus between the list and the action buttons |
+
+### Dashboard
+
 | Key | Action |
 |-----|--------|
 | `j`/`k` | cursor down/up |
 | `g`/`G` | top/bottom of list |
 | `space` | toggle row selection |
-| `escape` | clear selection |
-| `1`/`2`/`3`/`4` | filter: All / Missing / Orphans / Failed |
+| `escape` | clear selection; while a batch runs, stop it after the current track |
+| `1`/`2`/`3`/`4` | filter: All / Missing / Orphans / Failed (selection and cursor follow the same tracks across filters; selection clears only when new data is loaded) |
 | `d` | download (selected missing/failed rows, or all missing if none selected; a non-empty selection never falls back to all) |
 | `t` | trash/delete (selected orphans, or all if none selected; a non-empty selection never falls back to all) |
 | `x` | toggle delete mode (trash ↔ real delete) |
@@ -110,6 +133,42 @@ Output files follow `Artist - Song name.opus` (or the configured audio format).
 2. Exact normalized match on full stem (`Artist - Title.opus` ↔ playlist title `Artist - Title`)
 3. Title-portion match: if local filename contains ` - `, match on the last segment only (handles `Artist - Title.opus` ↔ playlist title `Title`)
 4. Fallback: `difflib.SequenceMatcher` ratio > 0.85 catches near-misses
+
+The fuzzy fallback is the only super-linear part of a refresh. It is gated by two
+provable upper bounds (length bound, then `quick_ratio`) and reuses one
+`SequenceMatcher` per local file, so an unmatched playlist entry only pays for the
+pairs that could still clear 0.85. A 100-unmatched × 1000-file rescan diffs in
+about 0.26 s; the pathological 1000 × 4000 fully-disjoint case still takes ~10 s
+(≈2.6 µs per comparison).
+
+## Refresh scoping
+
+`r`, the first load and a configuration change fetch the playlist. Downloading,
+trashing and retrying a row only rescan the folder and re-diff against the cached
+playlist — no yt-dlp round trip — and the loader plus `busy` state stay on until
+the table reflects the result. The table keeps its cursor row and scroll offset
+across rebuilds. `escape` during a batch requests a stop; the current track
+finishes, then the summary reports `stopped at k/n` and a local reconcile runs.
+
+Rows are keyed by identity, not position: `<track id>#<occurrence>` for playlist
+entries (duplicate videos get distinct keys) and the file path for orphans. That
+is why the cursor and the `▶` selection stay on the same tracks when you switch
+filters or rebuild the table; the visible number column is derived from display
+order. Tables over 1000 rows are committed in 500-row chunks off the event loop,
+so a filter switch on a huge playlist never blocks for the whole insert.
+`d`/`t` only act on selected rows that are visible in the current filter — a
+selection hidden by another filter is reported as "Nothing to …", never acted on
+sight unseen.
+
+The last rendered view per configuration is cached in
+`~/.local/share/yt-sync/view-cache.json` (8 newest entries, atomic replace).
+Startup paints those rows immediately, the status bar marks them
+`cached 12m · refreshing…`, and `d`/`t`/`enter` stay paused until the first real
+refresh lands. If that refresh fails the cached view stays, the status bar switches
+to `cached … · refresh failed — r to retry`, and the action guards say the same
+instead of pretending a refresh is running; `r` retries and re-enables actions.
+Corrupt or foreign cache files are ignored, and the cache is only read by the TUI
+(CLI modes never touch it).
 
 Current state: 17 missing, ~0 orphans (down from 49 after matching improvements).
 
@@ -127,7 +186,11 @@ through Textual workers — TUI stays responsive during yt-dlp calls.
 - **Per-item confirm dialog**: space+action is the confirm. Add `enter` keybinding for confirm dialog if safe defaults aren't enough.
 - **Visual theme switching**: config key `theme` exists but is a no-op. Textual is dark by default. Wire CSS variable overrides to it.
 - **Artist column in DataTable**: only Title column. Parse `Artist - Title` split in the table display if visual grouping matters.
-- **Multi-category selection**: selection clears on filter switch (1/2/3). Cross-category batch ops would need selection persistence.
+- **Cross-filter batch actions**: selection persists across filters, but `d`/`t`
+  only target selected rows visible in the current filter. If the whole selection
+  is hidden by the filter, the app says so (and does not fall back to "all", which
+  would act on rows the user cannot see). Acting on hidden rows would need an
+  explicit "apply to selection across filters" action.
 - **Download resume / skip-existing**: `--no-overwrites` is enabled, so existing output files are skipped.
 - **Progress bar widget**: replaced by RichLog line-by-line output. Add `ProgressBar` widget back if visual progress matters more than log history.
 - **Tests**: `python -m unittest test_yt_sync` covers setup validation/persistence, picker and startup lifecycle, selection→download/trash targeting, and Space keeping the cursor. Matching logic is still exercised via `yt-sync --diff-only`.
