@@ -1127,6 +1127,14 @@ class VisualRuntimeTests(StateIsolatedMixin, unittest.IsolatedAsyncioTestCase):
 
 
 class MainModeTests(StateIsolatedMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # main() checks runtime deps first; these tests cover dispatch only, so
+        # do not depend on mutagen/ffmpeg being installed in the test runner.
+        patcher = patch("yt_sync.require_runtime_dependencies")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_cli_mode_without_url_keeps_existing_error(self):
         cfg = {**DEFAULTS, "playlist_url": ""}
         with patch("yt_sync.load_config", return_value=cfg):
